@@ -27,8 +27,12 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
+      publish_release:
+        description: '发布 GitHub Release'
+        type: boolean
+        default: true
       tag:
-        description: 'Release tag（留空则只上传 Artifact）'
+        description: '自定义 Release tag（留空 = 自动 v<版本名>，当前即 v12.10.6）'
         required: false
         default: ''
 
@@ -167,15 +171,19 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      # ── 7. Release：tag 推送自动发；手动运行填了 tag 才发 ──
+      # ── 7. Release：tag 推送自动发；手动运行默认自动 v<APP_VERSION_NAME>，publish=false 则不发 ──
       - name: 确定 Release Tag
         id: rel
         shell: bash
         run: |
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.inputs.publish_release }}" = "true" ]; then
+            VN="$(grep -m1 '^APP_VERSION_NAME=' gradle.properties | cut -d= -f2-)"
+            INPUT_TAG="${{ github.event.inputs.tag }}"
+            echo "tag=${INPUT_TAG:-v${VN}}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: 同步到 GitHub Release
