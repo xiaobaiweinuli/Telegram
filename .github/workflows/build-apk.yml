@@ -39,9 +39,6 @@ concurrency:
   group: build-apk-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  NO_MINIFY_INIT: ${{ runner.temp }}/no-minify.init.gradle
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -73,6 +70,8 @@ jobs:
       # ── 3. 方案A：生成"无混淆" init 脚本（运行时注入，仓库文件零改动）──
       - name: 生成方案A 无混淆 init 脚本
         shell: bash
+        env:
+          NO_MINIFY_INIT: ${{ runner.temp }}/no-minify.init.gradle
         run: |
           cat > "$NO_MINIFY_INIT" <<'GROOVY'
           // 方案A：CI 运行时关闭代码混淆与资源瘦身，不修改仓库代码。
@@ -100,6 +99,8 @@ jobs:
       # 换用自己的签名时：把 gradle.properties 里的明文密码改成
       # -PRELEASE_STORE_PASSWORD="${{ secrets.… }}" 形式追加到下面命令即可
       - name: 构建主版 / web 版 / 华为版（方案A 无混淆）
+        env:
+          NO_MINIFY_INIT: ${{ runner.temp }}/no-minify.init.gradle
         run: |
           ./gradlew --stacktrace \
             -I "$NO_MINIFY_INIT" \
