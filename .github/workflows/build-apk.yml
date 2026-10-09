@@ -1,0 +1,187 @@
+# Telegram Android — GitHub Actions：构建 APK 并同步到 GitHub Release
+#
+# 触发方式：
+#   1) 推送 tag：  git tag v12.10.6-custom && git push origin v12.10.6-custom
+#                  → 构建 APK → 创建/更新同名 Release 并上传产物
+#   2) 手动运行（workflow_dispatch）：
+#        - tag 留空   → 只构建并上传 Artifact（保留 14 天）
+#        - tag 有值   → 构建并创建/更新该 tag 的 Release（tag 不存在则在当前 commit 上创建）
+#
+# 工具链与官方 Dockerfile 一致：
+#   JDK 17 / Gradle 8.13 (wrapper) / AGP 8.13.2 / SDK 36 / build-tools 36.0.0
+#   NDK 27.2.12479018 / CMake 3.22.1
+#   构建任务：:TMessagesProj_App:assembleAfatRelease（与官方 CMD 对应）
+#
+# 注意：
+#   - 签名开箱即用：仓库自带 TMessagesProj/config/release.keystore + gradle.properties 明文密码。
+#     若要对外分发，建议换自己的 keystore，密码改用 Secrets（见"构建"步骤注释）。
+#   - 必须递归拉子模块（media 模块 / jlatexmath 是 Gradle 配置阶段依赖），否则配置都过不去。
+#   - 私有仓库 runner 只有 2C/7G，gradle.properties 的 -Xmx8g 有 OOM 风险；
+#     公共仓库 runner 4C/16G 无此问题。
+
+name: Build Telegram APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag（留空则只上传 Artifact）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+    steps:
+      - name: Checkout（含全部子模块）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: 清理磁盘（4 ABI 原生构建需要空间）
+        shell: bash
+        run: |
+          sudo rm -rf \
+            "$ANDROID_SDK_ROOT/ndk" \
+            "$ANDROID_SDK_ROOT/emulator" \
+            "$ANDROID_SDK_ROOT/system-images" \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL*
+          sudo docker image prune -af > /dev/null 2>&1 || true
+          df -h /
+
+      - name: 缓存 NDK（约 2GB，避免每次重下）
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/android/sdk/ndk/27.2.12479018
+          key: ndk-27.2.12479018-${{ runner.os }}
+
+      - name: 设置 JDK 17（自动缓存 Gradle 依赖）
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: 安装 Android SDK 组件
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMGR=""
+          for c in "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+                   "$ANDROID_SDK_ROOT/cmdline-tools/bin/sdkmanager" \
+                   "$ANDROID_SDK_ROOT/tools/bin/sdkmanager"; do
+            if [ -x "$c" ]; then SDKMGR="$c"; break; fi
+          done
+          if [ -z "$SDKMGR" ]; then
+            curl -fL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o /tmp/cmdline-tools.zip
+            mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+            unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools-x
+            mv /tmp/cmdline-tools-x/cmdline-tools "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+            SDKMGR="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          yes | "$SDKMGR" --sdk_root="$ANDROID_SDK_ROOT" --licenses > /dev/null || true
+          "$SDKMGR" --sdk_root="$ANDROID_SDK_ROOT" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "platform-tools" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
+          df -h /
+
+      - name: 构建 Release APK
+        # 换用自己的签名时改为：
+        #   env:
+        #     RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+        #     RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        #   并把 gradle.properties 里的明文密码改成 $RELEASE_STORE_PASSWORD 等占位
+        run: ./gradlew --stacktrace :TMessagesProj_App:assembleAfatRelease
+
+      - name: 打包产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          VN="$(grep -m1 '^APP_VERSION_NAME=' gradle.properties | cut -d= -f2-)"
+          VC="$(grep -m1 '^APP_VERSION_CODE=' gradle.properties | cut -d= -f2-)"
+          SHA="$(git rev-parse --short HEAD)"
+          NAME="telegram-${VN}-${VC}-${SHA}"
+          mkdir -p dist
+
+          APK="$(find TMessagesProj_App/build/outputs/apk -type f -name '*.apk' -print -quit)"
+          if [ -z "$APK" ]; then echo "::error::未找到 APK 输出"; exit 1; fi
+          cp "$APK" "dist/${NAME}.apk"
+
+          MAP="$(find TMessagesProj_App/build/outputs/mapping -type f -name 'mapping.txt' -print -quit 2>/dev/null || true)"
+          if [ -n "$MAP" ]; then cp "$MAP" "dist/${NAME}-mapping.txt"; fi
+
+          SYM="$(find TMessagesProj_App/build/outputs -type f -name '*native-debug-symbols*.zip' -print -quit 2>/dev/null || true)"
+          if [ -n "$SYM" ]; then cp "$SYM" "dist/${NAME}-symbols.zip"; fi
+
+          echo "RELEASE_TITLE=Telegram ${VN} (${VC})" >> "$GITHUB_ENV"
+          ls -lh dist/
+          {
+            echo "### 构建完成"
+            echo "- 版本: ${VN} (${VC})，commit ${SHA}"
+            echo "- 产物: $(ls dist | tr '\n' ' ')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传构建产物（Artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-apk
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 确定 Release Tag
+        id: rel
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 同步到 GitHub Release
+        if: steps.rel.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.rel.outputs.tag }}"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            # 已有 Release（重复构建/重新打 tag）→ 覆盖上传
+            gh release upload "$TAG" dist/* --clobber
+            echo "已更新既有 Release: $TAG"
+          else
+            # 含 - 的 tag（如 v12.10.6-beta）自动标为预发布
+            EXTRA=()
+            case "$TAG" in
+              *-*) EXTRA+=(--prerelease) ;;
+            esac
+            gh release create "$TAG" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "${RELEASE_TITLE:-$TAG}" \
+              --generate-notes \
+              "${EXTRA[@]}"
+            echo "已创建 Release: $TAG"
+          fi
