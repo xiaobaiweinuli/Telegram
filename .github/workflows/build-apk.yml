@@ -1,23 +1,23 @@
-# Telegram Android — GitHub Actions：构建 APK 并同步到 GitHub Release
+# Telegram Android — GitHub Actions：构建 APK（方案A 无混淆）并同步到 GitHub Release
 #
-# 触发方式：
-#   1) 推送 tag：  git tag v12.10.6-custom && git push origin v12.10.6-custom
-#                  → 构建 APK → 创建/更新同名 Release 并上传产物
-#   2) 手动运行（workflow_dispatch）：
-#        - tag 留空   → 只构建并上传 Artifact（保留 14 天）
-#        - tag 有值   → 构建并创建/更新该 tag 的 Release（tag 不存在则在当前 commit 上创建）
+# 约束：不修改仓库任何代码，本 yml 是唯一新增文件。
+#   方案A（关闭 R8 混淆 + 资源瘦身）由构建步骤注入 Gradle init 脚本实现
+#   （写在 $RUNNER_TEMP，不进仓库，效果等同改 minifyEnabled false）。
 #
-# 工具链与官方 Dockerfile 一致：
-#   JDK 17 / Gradle 8.13 (wrapper) / AGP 8.13.2 / SDK 36 / build-tools 36.0.0
-#   NDK 27.2.12479018 / CMake 3.22.1
-#   构建任务：:TMessagesProj_App:assembleAfatRelease（与官方 CMD 对应）
+# 构建内容（除 Play AAB、Beta 外的全部版本，共 3 个 APK）：
+#   主版 / web 版 / 华为版
 #
-# 注意：
-#   - 签名开箱即用：仓库自带 TMessagesProj/config/release.keystore + gradle.properties 明文密码。
-#     若要对外分发，建议换自己的 keystore，密码改用 Secrets（见"构建"步骤注释）。
-#   - 必须递归拉子模块（media 模块 / jlatexmath 是 Gradle 配置阶段依赖），否则配置都过不去。
-#   - 私有仓库 runner 只有 2C/7G，gradle.properties 的 -Xmx8g 有 OOM 风险；
-#     公共仓库 runner 4C/16G 无此问题。
+# 设计依据（6 个 Telegram fork 的 workflow 调研 + GitHub 官方文档）：
+#   - 不清磁盘：官方 runner 可用空间 14GB 足够，6 家 fork 中 3 家完全不清照样构建；
+#     需要时再按 forkgram 形态（free-disk-space 且 android:false）加回
+#   - 不装 SDK 组件、不缓存 NDK：platform-36 / build-tools 36.0.0 用镜像预装；
+#     钉死的 NDK 27.2.12479018 / CMake 3.22.1 依赖 AGP 自动下载（镜像 license
+#     已接受，fork 中 2 家未装 cmake 照跑）。⚠ 首跑若报 NDK not found，
+#     需把 sdkmanager 安装步加回
+#   - actions 全部 Node24 代际：checkout@v6 / setup-java@v5 / upload-artifact@v5 /
+#     gradle/actions setup-gradle@v6 / softprops gh-release@v3 → 消除 Node20 弃用警告
+#   - 签名开箱即用（仓库自带 keystore）；对外分发建议换自己的 key，见构建步骤注释
+#   - 私有仓库 runner 仅 8GB 内存：构建命令用 -Xmx4g 覆盖 gradle.properties 的 8g
 
 name: Build Telegram APK
 
@@ -39,81 +39,84 @@ concurrency:
   group: build-apk-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  NO_MINIFY_INIT: ${{ runner.temp }}/no-minify.init.gradle
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-    env:
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+    timeout-minutes: 240
 
     steps:
+      # ── 1. 代码与全部子模块（media 模块 / jlatexmath 是 Gradle 配置期依赖，缺一不可）──
       - name: Checkout（含全部子模块）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
           submodules: recursive
 
-      - name: 清理磁盘（4 ABI 原生构建需要空间）
-        shell: bash
+      - name: 子模块二次保险（forkgram/Qorvhex 做法）
         run: |
-          sudo rm -rf \
-            "$ANDROID_SDK_ROOT/ndk" \
-            "$ANDROID_SDK_ROOT/emulator" \
-            "$ANDROID_SDK_ROOT/system-images" \
-            /usr/share/dotnet \
-            /opt/ghc \
-            /usr/local/.ghcup \
-            /opt/hostedtoolcache/CodeQL*
-          sudo docker image prune -af > /dev/null 2>&1 || true
-          df -h /
+          git submodule sync --recursive
+          git submodule update --init --recursive --depth 1
 
-      - name: 缓存 NDK（约 2GB，避免每次重下）
-        uses: actions/cache@v4
-        with:
-          path: /usr/local/lib/android/sdk/ndk/27.2.12479018
-          key: ndk-27.2.12479018-${{ runner.os }}
-
-      - name: 设置 JDK 17（自动缓存 Gradle 依赖）
-        uses: actions/setup-java@v4
+      # ── 2. JDK 17 + Gradle 官方缓存（Node24）──
+      - name: 设置 JDK 17
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
 
-      - name: 安装 Android SDK 组件
+      - name: 设置 Gradle（依赖与构建缓存）
+        uses: gradle/actions/setup-gradle@v6
+
+      # ── 3. 方案A：生成"无混淆" init 脚本（运行时注入，仓库文件零改动）──
+      - name: 生成方案A 无混淆 init 脚本
         shell: bash
         run: |
-          set -euo pipefail
-          SDKMGR=""
-          for c in "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
-                   "$ANDROID_SDK_ROOT/cmdline-tools/bin/sdkmanager" \
-                   "$ANDROID_SDK_ROOT/tools/bin/sdkmanager"; do
-            if [ -x "$c" ]; then SDKMGR="$c"; break; fi
-          done
-          if [ -z "$SDKMGR" ]; then
-            curl -fL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o /tmp/cmdline-tools.zip
-            mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
-            unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools-x
-            mv /tmp/cmdline-tools-x/cmdline-tools "$ANDROID_SDK_ROOT/cmdline-tools/latest"
-            SDKMGR="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          fi
-          yes | "$SDKMGR" --sdk_root="$ANDROID_SDK_ROOT" --licenses > /dev/null || true
-          "$SDKMGR" --sdk_root="$ANDROID_SDK_ROOT" \
-            "platforms;android-36" \
-            "build-tools;36.0.0" \
-            "platform-tools" \
-            "ndk;27.2.12479018" \
-            "cmake;3.22.1"
-          df -h /
+          cat > "$NO_MINIFY_INIT" <<'GROOVY'
+          // 方案A：CI 运行时关闭代码混淆与资源瘦身，不修改仓库代码。
+          // 在 beforeProject 中注册 afterEvaluate，保证先于 AGP 的变体创建执行，
+          // 把所有 application 模块各 buildType 的 minifyEnabled/shrinkResources 覆盖为 false。
+          gradle.beforeProject { proj ->
+              proj.afterEvaluate {
+                  if (proj.plugins.hasPlugin('com.android.application')) {
+                      proj.android.buildTypes.all { bt ->
+                          bt.minifyEnabled = false
+                          bt.shrinkResources = false
+                          println("[no-minify] ${proj.path} : ${bt.name}")
+                      }
+                  }
+              }
+          }
+          GROOVY
+          echo "已生成 $NO_MINIFY_INIT:"
+          cat "$NO_MINIFY_INIT"
 
-      - name: 构建 Release APK
-        # 换用自己的签名时改为：
-        #   env:
-        #     RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
-        #     RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
-        #   并把 gradle.properties 里的明文密码改成 $RELEASE_STORE_PASSWORD 等占位
-        run: ./gradlew --stacktrace :TMessagesProj_App:assembleAfatRelease
+      - name: chmod gradlew
+        run: chmod +x gradlew
 
+      # ── 4. 构建：主版 / web 版 / 华为版（均为官方 Dockerfile 验证过的任务）──
+      # 换用自己的签名时：把 gradle.properties 里的明文密码改成
+      # -PRELEASE_STORE_PASSWORD="${{ secrets.… }}" 形式追加到下面命令即可
+      - name: 构建主版 / web 版 / 华为版（方案A 无混淆）
+        run: |
+          ./gradlew --stacktrace \
+            -I "$NO_MINIFY_INIT" \
+            -Dorg.gradle.jvmargs=-Xmx4g \
+            :TMessagesProj_App:assembleAfatRelease \
+            :TMessagesProj_AppStandalone:assembleAfatStandalone \
+            :TMessagesProj_AppHuawei:assembleAfatRelease
+
+      - name: 失败时输出 CMake / Ninja 日志（Qorvhex 做法）
+        if: failure()
+        run: |
+          echo "=== CMake / Ninja logs ==="
+          find TMessagesProj/.cxx -type f \( -name '*.log' -o -name '*.txt' \) 2>/dev/null \
+            | head -n 20 | while IFS= read -r f; do echo "--- $f ---"; tail -n 100 "$f"; done
+
+      # ── 5. 打包：主/web/华为 必须存在（Telegraher 式 verify）；
+      #      同时检测 mapping.txt 验证方案A 是否真正生效 ──
       - name: 打包产物
         shell: bash
         run: |
@@ -124,32 +127,46 @@ jobs:
           NAME="telegram-${VN}-${VC}-${SHA}"
           mkdir -p dist
 
-          APK="$(find TMessagesProj_App/build/outputs/apk -type f -name '*.apk' -print -quit)"
-          if [ -z "$APK" ]; then echo "::error::未找到 APK 输出"; exit 1; fi
-          cp "$APK" "dist/${NAME}.apk"
+          req() {
+            if [ -f "$1" ]; then
+              cp "$1" "dist/$2"
+            else
+              echo "::error::缺少产物 $2（预期路径：$1）"
+              find "$(dirname "$1")/.." -type f 2>/dev/null | head -n 30 >&2 || true
+              return 1
+            fi
+          }
+          req "TMessagesProj_App/build/outputs/apk/afat/release/app.apk"             "${NAME}.apk"
+          req "TMessagesProj_AppStandalone/build/outputs/apk/afat/standalone/app.apk" "${NAME}-web.apk"
+          req "TMessagesProj_AppHuawei/build/outputs/apk/afat/release/app-huawei.apk" "${NAME}-huawei.apk"
 
-          MAP="$(find TMessagesProj_App/build/outputs/mapping -type f -name 'mapping.txt' -print -quit 2>/dev/null || true)"
-          if [ -n "$MAP" ]; then cp "$MAP" "dist/${NAME}-mapping.txt"; fi
+          # 方案A 自检：出现 mapping.txt 说明混淆没关掉
+          if find TMessagesProj_App/build/outputs/mapping -name 'mapping.txt' 2>/dev/null | grep -q .; then
+            echo "::warning::检测到 mapping.txt —— 方案A（无混淆）init 脚本可能未生效"
+          fi
 
-          SYM="$(find TMessagesProj_App/build/outputs -type f -name '*native-debug-symbols*.zip' -print -quit 2>/dev/null || true)"
-          if [ -n "$SYM" ]; then cp "$SYM" "dist/${NAME}-symbols.zip"; fi
-
+          (cd dist && sha256sum * > SHA256SUMS.txt)
           echo "RELEASE_TITLE=Telegram ${VN} (${VC})" >> "$GITHUB_ENV"
+          echo "APK_NAME=${NAME}" >> "$GITHUB_ENV"
           ls -lh dist/
           {
-            echo "### 构建完成"
-            echo "- 版本: ${VN} (${VC})，commit ${SHA}"
-            echo "- 产物: $(ls dist | tr '\n' ' ')"
+            echo "### 构建完成（方案A 无混淆）"
+            echo "- 版本 ${VN} (${VC})，commit ${SHA}"
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # ── 6. Artifact（Node24 版本）──
       - name: 上传构建产物（Artifact）
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: telegram-apk
           path: dist/
           if-no-files-found: error
           retention-days: 14
 
+      # ── 7. Release：tag 推送自动发；手动运行填了 tag 才发 ──
       - name: 确定 Release Tag
         id: rel
         shell: bash
@@ -162,26 +179,13 @@ jobs:
 
       - name: 同步到 GitHub Release
         if: steps.rel.outputs.tag != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.rel.outputs.tag }}"
-          if gh release view "$TAG" > /dev/null 2>&1; then
-            # 已有 Release（重复构建/重新打 tag）→ 覆盖上传
-            gh release upload "$TAG" dist/* --clobber
-            echo "已更新既有 Release: $TAG"
-          else
-            # 含 - 的 tag（如 v12.10.6-beta）自动标为预发布
-            EXTRA=()
-            case "$TAG" in
-              *-*) EXTRA+=(--prerelease) ;;
-            esac
-            gh release create "$TAG" dist/* \
-              --target "$GITHUB_SHA" \
-              --title "${RELEASE_TITLE:-$TAG}" \
-              --generate-notes \
-              "${EXTRA[@]}"
-            echo "已创建 Release: $TAG"
-          fi
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          name: ${{ env.RELEASE_TITLE }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          body_path: dist/SHA256SUMS.txt
+          generate_release_notes: true
+          prerelease: ${{ contains(steps.rel.outputs.tag, '-') }}
