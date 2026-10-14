@@ -1,33 +1,5 @@
 # Telegram Android — GitHub Actions：构建 APK（方案A 无混淆）并同步到 GitHub Release
 #
-# 约束：不修改仓库任何代码，本 yml 是唯一新增文件。
-#   方案A（关闭 R8 混淆 + 资源瘦身）由构建步骤注入 Gradle init 脚本实现
-#   （写在 $RUNNER_TEMP，不进仓库，效果等同改 minifyEnabled false）。
-#
-# 构建内容（除 Play AAB、Beta 外的全部版本，共 3 个 APK）：
-#   渐进式逐段构建逐段发布，顺序：web 版 → 主版 → 华为版
-#
-# 触发：tag 推送 / 手动 Run / push master（版本守卫）/ 每小时 cron（自动同步上游+版本守卫）
-#   版本守卫 = v<APP_VERSION_NAME> 的 Release 已正式发布且资产含 ≥3 个 APK → 秒级跳过；
-#   半成品 Release（草稿 / 资产不齐）会被下一次 cron 自动补建重跑，softprops 同名资产幂等覆盖；
-#   "上游发新版"的判定 = gradle.properties 版本号变化（比匹配提交信息可靠）
-#
-# 发布策略（渐进式，弃用 generate_release_notes）：
-#   每段 APK 构建成功即刻发布到同一 Release，正文 RELEASENOTES.md 随资产同步重建；
-#   自动变更列表只在创建 Release 时生成一次、之后任何正文覆盖都会把它冲掉——
-#   二者结构上不可兼得；上游变更行改由打包脚本从 git log 自行摘取
-#
-# 设计依据（6 个 Telegram fork 的 workflow 调研 + GitHub 官方文档）：
-#   - 不清磁盘：官方 runner 可用空间 14GB 足够，6 家 fork 中 3 家完全不清照样构建；
-#     需要时再按 forkgram 形态（free-disk-space 且 android:false）加回
-#   - 不装 SDK 组件、不缓存 NDK：platform-36 / build-tools 36.0.0 用镜像预装；
-#     钉死的 NDK 27.2.12479018 / CMake 3.22.1 依赖 AGP 自动下载（镜像 license
-#     已接受）—— 已实证：实测自动下载仅 13 秒完成，无需任何安装步骤
-#   - actions 全部 Node24 代际：checkout@v6 / setup-java@v5 / upload-artifact@v7 /
-#     gradle/actions setup-gradle@v6 / softprops gh-release@v3 → 消除 Node20 弃用警告
-#   - 签名开箱即用（仓库自带 keystore）；对外分发建议换自己的 key，见构建步骤注释
-#   - 内存：构建命令用 "-Xmx4g -XX:MaxMetaspaceSize=1g" 覆盖 gradle.properties 的 8g
-#     （补回整串覆盖会丢掉的 metaspace 上限；16GB 公共 runner 上也给原生编译留余量）
 
 name: Build Telegram APK
 
@@ -38,7 +10,7 @@ on:
     branches:
       - master
   schedule:
-    - cron: '23 * * * *'
+    - cron: '23 3,15 * * *'
   workflow_dispatch:
     inputs:
       publish_release:
@@ -46,7 +18,7 @@ on:
         type: boolean
         default: true
       tag:
-        description: '自定义 Release tag（留空 = 自动 v<版本名>，当前即 v12.10.6）'
+        description: '自定义 Release tag（留空 = 自动 v<版本名>）'
         required: false
         default: ''
 
@@ -58,18 +30,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ── 甲/乙：轻量守卫 job（不同步不构建时秒级结束，不装 JDK 不拉子模块）──
+  # ── 轻量守卫 job（不同步不构建时秒级结束，不装 JDK 不拉子模块）──
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       should_build: ${{ steps.guard.outputs.should_build }}
     steps:
-      # 乙：仅定时触发时调 GitHub 官方 Sync fork API（等价网页 Update branch）
-      #     响应码按官方状态表（docs.github.com "Sync a fork branch" 原文）：
-      #     200=同步成功；409=merge conflict 无法同步；422=其它原因无法同步
-      #     （含已是最新 / 未配置 upstream 等）——409 绝不是"已是最新"
-      #     请求用官方现行 body 形态（当前文档 branch 为 body 参数，非路径参数）
       - name: 同步上游（仅定时触发）
         if: github.event_name == 'schedule'
         env:
@@ -109,8 +76,7 @@ jobs:
             exit 0
           fi
           VN="$(grep -m1 '^APP_VERSION_NAME=' gradle.properties | cut -d= -f2-)"
-          # 渐进发布下 Release 可能是"半成品"（首段成功后构建中断）——守卫按
-          # 资产完整性判定：只有"正式发布 且 3 个 APK 齐全"才跳过；
+          # 单次发布也可能留下"半成品"（如资产上传中断、或历史遗留草稿）——守卫按资产完整性判定：只有"正式发布 且 3 个 APK 齐全"才跳过；
           # 草稿 / 缺资产 → 放行重跑，softprops overwrite_files 幂等补齐
           row="$(gh release view "v${VN}" --json isDraft,assets \
                  --jq '[.isDraft, ([.assets[].name | select(endswith(".apk"))] | length)] | @tsv' \
@@ -156,14 +122,6 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # 缓存策略（setup-gradle 默认行为与已知坑）：
-      #   - cache-read-only 默认在非默认分支/tag 上为 true → tag 构建只读不写，
-      #     供血主要靠 push master 与通过守卫的 schedule 构建
-      #   - 缓存 key 含 git-sha，master 每推一次写一个全量条目（实测 ~500-650MB/条）；
-      #     单仓库缓存上限 10GB、7 天未访问淘汰 → 用 cleanup + 排除项控制体积防 LRU 淘汰
-      #   - 排除 build-cache-1：本地 build cache 对一次性 CI 构建价值最低、体积最大
-      #   - cache-cleanup: always：失败的运行也先清理再写，避免缓存只进不出
-      #   - setup-java 故意不配 cache: gradle：与本步骤叠加会双写同一缓存区（官方不建议）
       - name: 设置 Gradle（依赖与构建缓存）
         uses: gradle/actions/setup-gradle@v6
         with:
@@ -171,14 +129,14 @@ jobs:
           gradle-home-cache-excludes: |
             caches/build-cache-1
 
-      # ── 3. 方案A：生成"无混淆" init 脚本（运行时注入，仓库文件零改动）──
+      # ── 3. 生成"无混淆" init 脚本（运行时注入，仓库文件零改动）──
       - name: 生成方案A 无混淆 init 脚本
         shell: bash
         env:
           NO_MINIFY_INIT: ${{ runner.temp }}/no-minify.init.gradle
         run: |
           cat > "$NO_MINIFY_INIT" <<'GROOVY'
-          // 方案A：CI 运行时关闭代码混淆与资源瘦身，不修改仓库代码。
+          // CI 运行时关闭代码混淆与资源瘦身，不修改仓库代码。
           // 在 beforeProject 中注册 afterEvaluate，保证先于 AGP 的变体创建执行，
           // 把所有 application 模块各 buildType 的 minifyEnabled/shrinkResources 覆盖为 false。
           gradle.beforeProject { proj ->
@@ -199,74 +157,7 @@ jobs:
       - name: chmod gradlew
         run: chmod +x gradlew
 
-      # ── 4. 打包工具脚本：三段构建共用（校验产物 / 求哈希 / 重建渐进式正文）──
-      - name: 生成打包脚本（渐进式发布共用）
-        shell: bash
-        run: |
-          cat > "$RUNNER_TEMP/pkg.sh" <<'BASH'
-          #!/usr/bin/env bash
-          # 用法: pkg.sh <APK源路径> <输出后缀>
-          # 渐进式（路线甲）：每次调用只校验本段产物，并重建正文——正文只收录当前
-          # 已存在的 APK，保证任意时刻 Release 说明与资产一一对应。
-          # 哈希不落盘：只存在于正文表格（文件|包名|说明|SHA-256）与 Job Summary。
-          # 正文写到 $RUNNER_TEMP（不进 dist）→ 只当 Release 说明，不作为资产上传（方案B）。
-          set -euo pipefail
-          VN="$(grep -m1 '^APP_VERSION_NAME=' gradle.properties | cut -d= -f2-)"
-          VC="$(grep -m1 '^APP_VERSION_CODE=' gradle.properties | cut -d= -f2-)"
-          SHA="$(git rev-parse --short HEAD)"
-          NAME="telegram-${VN}-${VC}-${SHA}"
-          mkdir -p dist
-          if [ ! -f "$1" ]; then
-            echo "::error::缺少产物 ${NAME}${2}（预期路径：$1）"
-            find "$(dirname "$1")/.." -type f 2>/dev/null | head -n 30 >&2 || true
-            exit 1
-          fi
-          cp "$1" "dist/${NAME}${2}"
-          NOTES="$RUNNER_TEMP/RELEASENOTES.md"
-          # 表格行：文件（有 RELEASE_TAG 时拼直链，否则纯文本）| 包名 | 说明 | SHA-256
-          row() {
-            local f="$1" pkg="$2" desc="$3" cell h
-            [ -f "dist/$f" ] || return 0
-            h="$(sha256sum "dist/$f" | cut -d' ' -f1)"
-            if [ -n "${RELEASE_TAG:-}" ]; then
-              cell="[\`$f\`](https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/$f)"
-            else
-              cell="\`$f\`"
-            fi
-            echo "| $cell | $pkg | $desc | \`$h\` |"
-          }
-          {
-            echo "# Telegram ${VN} (${VC})"
-            echo
-            echo "- commit: \`${SHA}\`"
-            echo "- 构建形态：方案A 无混淆（R8 全关）· 4 ABI fat APK · 签名 = 仓库 release.keystore"
-            UP="$(git log -20 --format='%s|%h' | grep -m1 '^update to ' || true)"
-            if [ -n "$UP" ]; then
-              echo "- 上游变更：${UP%%|*}（${UP##*|}）"
-            fi
-            echo
-            echo "| 文件（点击下载） | 包名 | 说明 | SHA-256 |"
-            echo "|---|---|---|---|"
-            row "${NAME}.apk"        "org.telegram.messenger"      "主版"
-            row "${NAME}-web.apk"    "org.telegram.messenger.web"  "独立包名，可与主版并存"
-            row "${NAME}-huawei.apk" "org.telegram.messenger"      "华为渠道（HMS），与主版同包名互相覆盖"
-          } > "$NOTES"
-          echo "RELEASE_TITLE=Telegram ${VN} (${VC})" >> "$GITHUB_ENV"
-          ls -lh dist/
-          # Job Summary：写到运行页 Summary 标签（与 Release 说明是两个页面），每段追加一次进度快照
-          {
-            echo "### 渐进构建进度（方案A 无混淆）"
-            echo "- 版本 ${VN} (${VC})，commit \`${SHA}\`，dist 内 APK：$(ls dist/*.apk 2>/dev/null | wc -l)/3"
-            echo "- Release tag：${RELEASE_TAG:-（本次未发布）}"
-            echo '```'
-            (cd dist && sha256sum *.apk)
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          BASH
-          chmod +x "$RUNNER_TEMP/pkg.sh"
-          echo "打包脚本已生成: $RUNNER_TEMP/pkg.sh"
-
-      # ── 5. 确定 Release tag（三段发布共用，须在首段发布前完成）──
+      # ── 4. 确定 Release tag（打包与发布共用，须在打包前完成；导出 RELEASE_TAG 供表格拼直链）──
       - name: 确定 Release Tag
         id: rel
         shell: bash
@@ -295,10 +186,8 @@ jobs:
           # 同步导出给打包脚本：正文表格用它拼资产直链；未发布时为空 → 打包回退纯文本
           echo "RELEASE_TAG=$T" >> "$GITHUB_ENV"
 
-      # ── 6. 第 1 段：web 版（构建成功即发布——渐进式发布起点）──
-      # 换用自己的签名时：把 gradle.properties 里的明文密码改成
-      # -PRELEASE_STORE_PASSWORD="${{ secrets.… }}" 形式追加到构建命令即可
-      - name: 构建 web 版（第1段）
+      # ── 5. 构建：主版 / web 版 / 华为版
+      - name: 构建主版 / web 版 / 华为版（方案A 无混淆）
         env:
           NO_MINIFY_INIT: ${{ runner.temp }}/no-minify.init.gradle
         run: |
@@ -306,10 +195,18 @@ jobs:
           ./gradlew --stacktrace \
             -I "$NO_MINIFY_INIT" \
             -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" \
+            :TMessagesProj_App:assembleAfatRelease \
             :TMessagesProj_AppStandalone:assembleAfatStandalone \
+            :TMessagesProj_AppHuawei:assembleAfatRelease \
             2>&1 | tee gradle-build.log
 
-          # 方案A 自检：init 在 configure 阶段为全部 application 模块打印 [no-minify]
+      # ── 6. 打包：三产物必须齐（Telegraher 式 verify）
+      - name: 打包产物
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 方案A 自检：init 脚本必须为 3 个 application 模块各打印过 [no-minify]
           for m in ':TMessagesProj_App' ':TMessagesProj_AppStandalone' ':TMessagesProj_AppHuawei'; do
             if ! grep -q "\[no-minify\] ${m} " gradle-build.log; then
               echo "::error::方案A init 脚本未覆盖模块 ${m}（gradle-build.log 无 [no-minify]）"
@@ -318,12 +215,68 @@ jobs:
           done
           echo "方案A 自检通过：3 个模块均已关闭混淆"
 
-          bash "$RUNNER_TEMP/pkg.sh" \
-            "TMessagesProj_AppStandalone/build/outputs/apk/afat/standalone/app.apk" "-web.apk"
+          VN="$(grep -m1 '^APP_VERSION_NAME=' gradle.properties | cut -d= -f2-)"
+          VC="$(grep -m1 '^APP_VERSION_CODE=' gradle.properties | cut -d= -f2-)"
+          SHA="$(git rev-parse --short HEAD)"
+          NAME="telegram-${VN}-${VC}-${SHA}"
+          mkdir -p dist
 
-      # 首段创建 Release（name/prerelease/target_commitish 仅创建时生效；
-      # 后续段省略这些键 → 官方 README：保留原值）
-      - name: 发布 Release（web 版，创建）
+          req() {
+            if [ -f "$1" ]; then
+              cp "$1" "dist/$2"
+            else
+              echo "::error::缺少产物 $2（预期路径：$1）"
+              find "$(dirname "$1")/.." -type f 2>/dev/null | head -n 30 >&2 || true
+              return 1
+            fi
+          }
+          req "TMessagesProj_App/build/outputs/apk/afat/release/app.apk"             "${NAME}.apk"
+          req "TMessagesProj_AppStandalone/build/outputs/apk/afat/standalone/app.apk" "${NAME}-web.apk"
+          req "TMessagesProj_AppHuawei/build/outputs/apk/afat/release/app-huawei.apk" "${NAME}-huawei.apk"
+
+          # 表格行：文件（RELEASE_TAG 存在时拼直链，否则纯文本）| 包名 | 说明 | SHA-256
+          row() {
+            local f="$1" pkg="$2" desc="$3" cell h
+            [ -f "dist/$f" ] || return 0
+            h="$(sha256sum "dist/$f" | cut -d' ' -f1)"
+            if [ -n "${RELEASE_TAG:-}" ]; then
+              cell="[\`$f\`](https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/$f)"
+            else
+              cell="\`$f\`"
+            fi
+            echo "| $cell | $pkg | $desc | \`$h\` |"
+          }
+          NOTES="$RUNNER_TEMP/RELEASENOTES.md"
+          {
+            echo "# Telegram ${VN} (${VC})"
+            echo
+            echo "- commit: \`${SHA}\`"
+            echo "- 构建形态：方案A 无混淆（R8 全关）· 4 ABI fat APK · 签名 = 仓库 release.keystore"
+            UP="$(git log -20 --format='%s|%h' | grep -m1 '^update to ' || true)"
+            if [ -n "$UP" ]; then
+              echo "- 上游变更：${UP%%|*}（${UP##*|}）"
+            fi
+            echo
+            echo "| 文件。 | 包名 | 说明 | SHA-256 |"
+            echo "|---|---|---|---|"
+            row "${NAME}.apk"        "org.telegram.messenger"      "主版"
+            row "${NAME}-web.apk"    "org.telegram.messenger.web"  "独立包名，可与主版并存"
+            row "${NAME}-huawei.apk" "org.telegram.messenger"      "华为渠道（HMS），与主版同包名互相覆盖"
+          } > "$NOTES"
+
+          echo "RELEASE_TITLE=Telegram ${VN} (${VC})" >> "$GITHUB_ENV"
+          ls -lh dist/
+          {
+            echo "### 构建完成"
+            echo "- 版本 ${VN} (${VC})，commit \`${SHA}\`，APK：$(ls dist/*.apk | wc -l)/3"
+            echo "- Release tag：${RELEASE_TAG:-（本次未发布）}"
+            echo '```'
+            (cd dist && sha256sum *.apk)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── 7. 单次发布：三 APK 校验齐全后一次创建（自动变更列表追加在正文之后）──
+      - name: 发布 Release
         if: steps.rel.outputs.tag != ''
         uses: softprops/action-gh-release@v3
         with:
@@ -334,61 +287,16 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           body_path: ${{ runner.temp }}/RELEASENOTES.md
+          generate_release_notes: true
 
-      # ── 7. 第 2 段：主版（同 job 复用工作区：lib/native 已 UP-TO-DATE，纯增量）──
-      - name: 构建主版（第2段）
-        env:
-          NO_MINIFY_INIT: ${{ runner.temp }}/no-minify.init.gradle
-        run: |
-          set -o pipefail
-          ./gradlew --stacktrace \
-            -I "$NO_MINIFY_INIT" \
-            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" \
-            :TMessagesProj_App:assembleAfatRelease \
-            2>&1 | tee -a gradle-build.log
-          bash "$RUNNER_TEMP/pkg.sh" \
-            "TMessagesProj_App/build/outputs/apk/afat/release/app.apk" ".apk"
-
-      - name: 发布 Release（主版追加）
-        if: steps.rel.outputs.tag != ''
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.rel.outputs.tag }}
-          files: dist/*
-          fail_on_unmatched_files: true
-          body_path: ${{ runner.temp }}/RELEASENOTES.md
-
-      # ── 8. 第 3 段：华为版（收尾）──
-      - name: 构建华为版（第3段）
-        env:
-          NO_MINIFY_INIT: ${{ runner.temp }}/no-minify.init.gradle
-        run: |
-          set -o pipefail
-          ./gradlew --stacktrace \
-            -I "$NO_MINIFY_INIT" \
-            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" \
-            :TMessagesProj_AppHuawei:assembleAfatRelease \
-            2>&1 | tee -a gradle-build.log
-          bash "$RUNNER_TEMP/pkg.sh" \
-            "TMessagesProj_AppHuawei/build/outputs/apk/afat/release/app-huawei.apk" "-huawei.apk"
-
-      - name: 发布 Release（华为版追加）
-        if: steps.rel.outputs.tag != ''
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.rel.outputs.tag }}
-          files: dist/*
-          fail_on_unmatched_files: true
-          body_path: ${{ runner.temp }}/RELEASENOTES.md
-
-      - name: 失败时输出 CMake / Ninja 日志（Qorvhex 做法）
+      - name: 失败时输出 CMake / Ninja 日志
         if: failure()
         run: |
           echo "=== CMake / Ninja logs ==="
           find TMessagesProj/.cxx -type f \( -name '*.log' -o -name '*.txt' \) 2>/dev/null \
             | head -n 20 | while IFS= read -r f; do echo "--- $f ---"; tail -n 100 "$f"; done
 
-      # ── 6. Artifact（渐进发布下：中途失败时已发布资产在 Release，此处只收全程成功）──
+      # ── 8. Artifact（备份：完整 dist，保留 3 天）──
       - name: 上传构建产物（Artifact）
         uses: actions/upload-artifact@v7
         with:
@@ -396,4 +304,3 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 3
-
