@@ -10,8 +10,8 @@
 #   守卫：v<APP_VERSION_NAME> 已发布且含 ≥3 个 APK → 秒跳；半成品由下轮 cron 补齐
 #   手动可填 build_ref = 上游 commit 哈希 → 按历史整树构建（回补漏建版本），留空 = 当前 commit
 #
-# 要点：NDK/CMake 靠 AGP 自动下载（实测 13s）；JVM 用 "-Xmx4g -XX:MaxMetaspaceSize=1g"；
-#   actions 全 Node24；签名 = 仓库 keystore（对外分发建议换自己的 key）
+# 要点：NDK/CMake 靠 AGP 自动下载（实测 13s）；ccache 跨版本复用原生编译对象（init 注入套壳）；
+#   JVM 用 "-Xmx4g -XX:MaxMetaspaceSize=1g"；actions 全 Node24；签名 = 仓库 keystore
 
 name: Build Telegram APK
 
@@ -113,6 +113,12 @@ jobs:
     if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    env:
+      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_COMPILERCHECK: content
+      CCACHE_NOHASHDIR: "1"
+      CCACHE_SLOPPINESS: file_stat_matches,include_file_mtime,include_file_ctime,time_macros
 
     steps:
       # ── 1. 检出（build_ref 指定时 = 历史 commit 整树，版本命名自动跟随）──
@@ -170,14 +176,30 @@ jobs:
           gradle-home-cache-excludes: |
             caches/build-cache-1
 
-      # ── 3. 生成无混淆 init 脚本 ──
-      - name: 生成方案A 无混淆 init 脚本
+      # ccache：跨版本复用原生编译对象（安装 → 恢复缓存 → 构建后统计/保存）
+      - name: 安装 ccache
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ccache
+          ccache --version | head -1
+          mkdir -p "$CCACHE_DIR"
+
+      - name: 恢复 ccache 缓存
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-ndk27.2-${{ hashFiles('TMessagesProj/jni/**', 'TMessagesProj/**/CMakeLists.txt') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-ndk27.2-
+
+      # ── 3. 生成 CI 注入脚本（方案A 无混淆 + ccache 编译器套壳）──
+      - name: 生成 CI 注入脚本
         shell: bash
         env:
           NO_MINIFY_INIT: ${{ runner.temp }}/no-minify.init.gradle
         run: |
           cat > "$NO_MINIFY_INIT" <<'GROOVY'
-          // 运行时关闭各模块 minifyEnabled/shrinkResources，不修改仓库代码
+          // 运行时注入，不改仓库代码：①关各模块混淆/资源瘦身 ②native 构建套 ccache
           gradle.beforeProject { proj ->
               proj.afterEvaluate {
                   if (proj.plugins.hasPlugin('com.android.application')) {
@@ -186,6 +208,13 @@ jobs:
                           bt.shrinkResources = false
                           println("[no-minify] ${proj.path} : ${bt.name}")
                       }
+                  }
+                  if (proj.plugins.hasPlugin('com.android.application') || proj.plugins.hasPlugin('com.android.library')) {
+                      proj.android.defaultConfig.externalNativeBuild.cmake.arguments(
+                          '-DCMAKE_C_COMPILER_LAUNCHER=ccache',
+                          '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache'
+                      )
+                      println("[ccache] ${proj.path}")
                   }
               }
           }
@@ -233,6 +262,16 @@ jobs:
             :TMessagesProj_AppHuawei:assembleAfatRelease \
             2>&1 | tee gradle-build.log
 
+      - name: ccache 统计（命中率观测）
+        if: always()
+        run: ccache -s || true
+
+      - name: 保存 ccache 缓存
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-ndk27.2-${{ hashFiles('TMessagesProj/jni/**', 'TMessagesProj/**/CMakeLists.txt') }}
+
       # ── 6. 打包：三产物齐全才放行 + 方案A 逐模块断言；
       #      正文 4 列表格 → $RUNNER_TEMP（只当 body、不作资产、无 SUMS）──
       - name: 打包产物
@@ -248,6 +287,10 @@ jobs:
             fi
           done
           echo "自检通过：3 个模块均已关闭混淆"
+
+          # ccache 注入自检（仅警告：属优化项，不影响产物正确性）
+          grep -qE '\[ccache\] :TMessagesProj$' gradle-build.log \
+            || echo "::warning::init 未向 TMessagesProj 注入 ccache 套壳（构建仍有效，但未加速）"
 
           VN="$(grep -m1 '^APP_VERSION_NAME=' gradle.properties | cut -d= -f2-)"
           VC="$(grep -m1 '^APP_VERSION_CODE=' gradle.properties | cut -d= -f2-)"
