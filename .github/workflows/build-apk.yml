@@ -433,6 +433,10 @@ jobs:
           VC="$(grep -m1 '^APP_VERSION_CODE=' gradle.properties | cut -d= -f2-)"
           SHA="$(git rev-parse --short HEAD)"
           NAME="telegram-${VN}-${VC}-${SHA}${ABI_SUFFIX:-}"
+          # 三个产物各自输出路径，供下面三个 Artifact 步骤精确引用
+          echo "main=${NAME}.apk" >> "$GITHUB_OUTPUT"
+          echo "web=${NAME}-web.apk" >> "$GITHUB_OUTPUT"
+          echo "huawei=${NAME}-huawei.apk" >> "$GITHUB_OUTPUT"
           mkdir -p dist
 
           req() {
@@ -519,12 +523,34 @@ jobs:
           body_path: ${{ runner.temp }}/RELEASENOTES.md
           generate_release_notes: true
 
-      # ── 9. Artifact（完整 dist，保留 3 天；发布失败也不丢产物）──
-      - name: 上传构建产物（Artifact）
+      # ── 9. Artifact：三个 APK 分开传（下载时按需取，不用下整包 140MB）──
+      #    保留 3 天；overwrite 防止重跑同一 run 时重名报错
+      - name: 上传构建产物（主版）
         if: ${{ !cancelled() && steps.pkg.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
-          name: telegram-apk
-          path: dist/
+          name: telegram-apk-main
+          path: dist/${{ steps.pkg.outputs.main }}
           if-no-files-found: error
+          overwrite: true
+          retention-days: 3
+
+      - name: 上传构建产物（web 版）
+        if: ${{ !cancelled() && steps.pkg.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: telegram-apk-web
+          path: dist/${{ steps.pkg.outputs.web }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 3
+
+      - name: 上传构建产物（华为版）
+        if: ${{ !cancelled() && steps.pkg.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: telegram-apk-huawei
+          path: dist/${{ steps.pkg.outputs.huawei }}
+          if-no-files-found: error
+          overwrite: true
           retention-days: 3
