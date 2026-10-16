@@ -45,6 +45,7 @@ on:
 
 permissions:
   contents: write
+  actions: write      # 删同名旧 ccache 缓存（缓存不可变，否则 save 永远被拒）
 
 concurrency:
   group: build-apk-${{ github.ref }}
@@ -217,7 +218,9 @@ jobs:
           restore-keys: |
             ccache-${{ runner.os }}-ndk27.2-
 
-      # ── 3. 生成 CI 注入脚本（方案A 无混淆 + ccache 编译器套壳）──
+      # ── 3. 构建期注入（都不入库，仓库源码保持干净）──
+      #   ① init 脚本：关混淆/资源瘦身 + ccache 套壳 + ABI 收窄
+      #   ② 版本号点击补丁：第一次点击弹窗（打开项目主页 / 调试菜单）
       - name: 生成 CI 注入脚本
         shell: bash
         env:
@@ -244,6 +247,11 @@ jobs:
                       def wantAbi = System.getenv('CI_ABI')
                       if (wantAbi) {
                           def abis = wantAbi.split(',') as Set
+                          // defaultConfig：覆盖没有 flavor 的模块（TMessagesProj 库承载全部原生编译，
+                          //   它没有 productFlavors，只写 flavor 分支会空转 → 4 个 ABI 全编）
+                          proj.android.defaultConfig.ndk.abiFilters.clear()
+                          abis.each { proj.android.defaultConfig.ndk.abiFilters.add(it) }
+                          // 有 flavor 的模块：flavor 会覆盖 defaultConfig，必须逐个再设一遍
                           proj.android.productFlavors.all { f ->
                               f.ndk.abiFilters.clear()
                               abis.each { f.ndk.abiFilters.add(it) }
@@ -256,6 +264,40 @@ jobs:
           GROOVY
           echo "已生成 $NO_MINIFY_INIT:"
           cat "$NO_MINIFY_INIT"
+
+      # 锚点 = 版本行"第一次点击只弹提示"那行；第二次点击的 openDebugMenu() 原样保留
+      - name: 注入版本号点击弹窗（构建期打补丁，不入库）
+        shell: bash
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          F=TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java
+          ANCHOR='Toast.makeText(getParentActivity(), getString(R.string.DebugMenuLongPress), Toast.LENGTH_SHORT).show();'
+          if [ "$(grep -cF "$ANCHOR" "$F")" != "1" ]; then
+            echo "::error::SettingsActivity 版本号锚点未唯一命中（上游可能改过这段），中止构建"
+            exit 1
+          fi
+          python3 - "$F" "$REPO_URL" <<'PY'
+          import sys
+          path, url = sys.argv[1], sys.argv[2]
+          anchor = 'Toast.makeText(getParentActivity(), getString(R.string.DebugMenuLongPress), Toast.LENGTH_SHORT).show();'
+          ind = ' ' * 20
+          lines = [
+              'AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), resourceProvider);',
+              'builder.setItems(new CharSequence[]{"打开项目主页", "调试菜单"}, (dialog, which) -> {',
+              '    if (which == 0) org.telegram.messenger.browser.Browser.openUrl(getParentActivity(), "%s");' % url,
+              '    else openDebugMenu();',
+              '});',
+              'builder.show();',
+          ]
+          # 锚点文本不含行首缩进：首行沿用原缩进，其余行补 20 空格
+          code = lines[0] + '\n' + '\n'.join(ind + l for l in lines[1:])
+          src = open(path, encoding='utf-8').read()
+          open(path, 'w', encoding='utf-8').write(src.replace(anchor, code, 1))
+          print('[inject] 版本号点击 -> 弹窗（打开项目主页 / 调试菜单），URL = %s' % url)
+          PY
+          grep -qF '打开项目主页' "$F" || { echo "::error::注入失败，未写入"; exit 1; }
+          grep -n -A5 '打开项目主页' "$F" | head -8
 
       - name: chmod gradlew
         run: chmod +x gradlew
@@ -320,6 +362,20 @@ jobs:
         if: always()
         run: ccache -s || true
 
+      # ccache 缓存不可变：同名条目一旦存在，后续 save 一律被拒（日志里的 "Failed to save"），
+      # 命中率就永远停在首次那份 → 保存前先删同名条目，让本次成果能写进去
+      - name: 删除同名旧 ccache 缓存
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_KEY: ccache-${{ runner.os }}-ndk27.2-${{ hashFiles('TMessagesProj/jni/**', 'TMessagesProj/**/CMakeLists.txt') }}
+        run: |
+          if gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/caches?key=${CACHE_KEY}" >/dev/null 2>&1; then
+            echo "已删除同名旧 ccache 缓存：${CACHE_KEY}"
+          else
+            echo "无同名旧缓存可删（首次运行属正常），继续保存"
+          fi
+
       - name: 保存 ccache 缓存
         if: always()
         uses: actions/cache/save@v5
@@ -356,10 +412,21 @@ jobs:
           grep -qE '\[ccache\] :TMessagesProj$' gradle-build.log \
             || echo "::warning::init 未向 TMessagesProj 注入 ccache 套壳（构建仍有效，但未加速）"
 
-          # ABI 收窄自检（仅警告：ABI 集合比对在下方 dist 上做最终裁决）
+          # ABI 收窄自检（仅警告）：① init 是否打印 [abi] ② 实际编译的 ABI 是否只剩请求的
+          #（APK 内 lib 集合在下方 dist 上做最终裁决；这里查的是"有没有白编别的 ABI"）
           if [ -n "${CI_ABI:-}" ]; then
             grep -qE "\[abi\] :TMessagesProj -> " gradle-build.log \
-              || echo "::warning::init 未打印 [abi] 行（ABI 收窄可能未生效，将由后续比对裁决）"
+              || echo "::warning::init 未打印 [abi] 行（ABI 收窄可能未生效）"
+            want="$(printf '%s' "$CI_ABI" | tr ',' '\n' | sort | paste -sd, -)"
+            built="$(grep -oE 'configureCMake[A-Za-z]+\[[a-z0-9_-]+\]' gradle-build.log \
+                     | sed 's/.*\[//; s/\]$//' | sort -u | paste -sd, - || true)"
+            if [ -z "$built" ]; then
+              echo "::warning::日志里没有 configureCMake 任务行，跳过编译层 ABI 自检"
+            elif [ "$built" != "$want" ]; then
+              echo "::warning::实际编译的 ABI [${built}] ≠ 请求 [${want}]（多编的 ABI 白耗构建时间）"
+            else
+              echo "编译层 ABI 自检通过：${built}"
+            fi
           fi
 
           VN="$(grep -m1 '^APP_VERSION_NAME=' gradle.properties | cut -d= -f2-)"
