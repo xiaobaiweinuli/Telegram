@@ -220,7 +220,7 @@ jobs:
 
       # ── 3. 构建期注入（都不入库，仓库源码保持干净）──
       #   ① init 脚本：关混淆/资源瘦身 + ccache 套壳 + ABI 收窄
-      #   ② 版本号点击补丁：第一次点击弹窗（打开项目主页 / 调试菜单）
+      #   ② 版本号点击补丁：每次点击都弹窗（打开项目主页 / 调试菜单）
       - name: 生成 CI 注入脚本
         shell: bash
         env:
@@ -265,39 +265,54 @@ jobs:
           echo "已生成 $NO_MINIFY_INIT:"
           cat "$NO_MINIFY_INIT"
 
-      # 锚点 = 版本行"第一次点击只弹提示"那行；第二次点击的 openDebugMenu() 原样保留
+      # 锚点 = 整个点击体（第一次只弹提示 + 第二次直接进菜单）→ 整段替换成"每次点击都弹窗"
       - name: 注入版本号点击弹窗（构建期打补丁，不入库）
         shell: bash
         env:
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
           F=TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java
-          ANCHOR='Toast.makeText(getParentActivity(), getString(R.string.DebugMenuLongPress), Toast.LENGTH_SHORT).show();'
-          if [ "$(grep -cF "$ANCHOR" "$F")" != "1" ]; then
-            echo "::error::SettingsActivity 版本号锚点未唯一命中（上游可能改过这段），中止构建"
-            exit 1
-          fi
           python3 - "$F" "$REPO_URL" <<'PY'
           import sys
           path, url = sys.argv[1], sys.argv[2]
-          anchor = 'Toast.makeText(getParentActivity(), getString(R.string.DebugMenuLongPress), Toast.LENGTH_SHORT).show();'
-          ind = ' ' * 20
-          lines = [
-              'AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), resourceProvider);',
-              'builder.setItems(new CharSequence[]{"打开项目主页", "调试菜单"}, (dialog, which) -> {',
-              '    if (which == 0) org.telegram.messenger.browser.Browser.openUrl(getParentActivity(), "%s");' % url,
-              '    else openDebugMenu();',
-              '});',
-              'builder.show();',
-          ]
-          # 锚点文本不含行首缩进：首行沿用原缩进，其余行补 20 空格
-          code = lines[0] + '\n' + '\n'.join(ind + l for l in lines[1:])
+          ind = ' ' * 12
+          # 锚点：整个点击体（带行首缩进，整段替换）
+          anchor = '\n'.join(ind + l for l in [
+              'versionViewPressCount++;',
+              'if (versionViewPressCount < 2 && !BuildVars.DEBUG_PRIVATE_VERSION) {',
+              '    try {',
+              '        Toast.makeText(getParentActivity(), getString(R.string.DebugMenuLongPress), Toast.LENGTH_SHORT).show();',
+              '    } catch (Exception e) {',
+              '        FileLog.e(e);',
+              '    }',
+              '    return;',
+              '}',
+              'openDebugMenu();',
+          ])
+          # 替换：每次点击都弹同一个弹窗（防误触由弹窗本身承担）
+          code = '\n'.join(ind + l for l in [
+              'try {',
+              '    AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), resourceProvider);',
+              '    builder.setItems(new CharSequence[]{"打开项目主页", "调试菜单"}, (dialog, which) -> {',
+              '        if (which == 0) org.telegram.messenger.browser.Browser.openUrl(getParentActivity(), "%s");' % url,
+              '        else openDebugMenu();',
+              '    });',
+              '    builder.show();',
+              '} catch (Exception e) {',
+              '    FileLog.e(e);',
+              '}',
+          ])
           src = open(path, encoding='utf-8').read()
+          n = src.count(anchor)
+          if n != 1:
+              print('::error::SettingsActivity 锚点命中 %d 次（应为 1），上游可能改过这段，中止构建' % n)
+              sys.exit(1)
           open(path, 'w', encoding='utf-8').write(src.replace(anchor, code, 1))
-          print('[inject] 版本号点击 -> 弹窗（打开项目主页 / 调试菜单），URL = %s' % url)
+          print('[inject] 版本号点击 -> 每次点击都弹窗（打开项目主页 / 调试菜单），URL = %s' % url)
           PY
           grep -qF '打开项目主页' "$F" || { echo "::error::注入失败，未写入"; exit 1; }
-          grep -n -A5 '打开项目主页' "$F" | head -8
+          grep -qF 'openDebugMenu();' "$F" || { echo "::error::注入后调试菜单入口丢失"; exit 1; }
+          grep -n -A8 '打开项目主页' "$F" | head -12
 
       - name: chmod gradlew
         run: chmod +x gradlew
