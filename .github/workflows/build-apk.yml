@@ -5,7 +5,7 @@
 # 构建/发布：单次调用并行构建 主版/web/华为，校验齐全后一次性发布；
 #   正文 = 4 列表格（直链 + SHA-256，写 $RUNNER_TEMP 不作资产）+ generate_release_notes 追加。
 #
-# 触发：tag 推送 / 手动 Run / push master / cron 每天两次（03:23、15:23 UTC，自动同步上游）
+# 触发：tag 推送 / 手动 Run / push master / cron 每天一次 / webhook推送（自动同步上游）
 #   定时同步后按 master 头构建（check 把实际检出的 commit 传给 build）；github.sha 是触发快照，改不动
 #   守卫：v<APP_VERSION_NAME> 已发布且含 ≥3 个 APK → 秒跳；半成品由下轮 cron 补齐
 #   手动可填 build_ref = 上游 commit 哈希 → 按历史整树构建（回补漏建版本），留空 = 当前 commit
@@ -22,8 +22,12 @@ on:
       - 'v*'
     branches:
       - master
+    paths-ignore:
+      - '.github/workflows/**'  # 排除所有工作流文件的修改
   schedule:
-    - cron: '23 3,15 * * *'
+    - cron: '23 3 * * *'        # 每天一次兜底
+  repository_dispatch:
+    types: [upstream_updated]   # Worker 触发信号
   workflow_dispatch:
     inputs:
       publish_release:
@@ -72,32 +76,18 @@ jobs:
             -H "X-GitHub-Api-Version: 2026-03-10" \
             -d '{"branch":"master"}' \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/merge-upstream")
-          if [ "$code" = 200 ]; then
-            echo "已从上游同步新提交:"; cat /tmp/sync.json
-          elif [ "$code" = 409 ]; then
-            echo "::warning::同步失败：与上游存在 merge conflict（409），需手动解决"
-            cat /tmp/sync.json
-          elif [ "$code" = 422 ]; then
-            echo "::warning::同步失败：其它原因（422，如已是最新/未配置 upstream），继续走守卫"
-            cat /tmp/sync.json
-          else
-            echo "::warning::sync 返回 $code（继续走守卫）"; cat /tmp/sync.json
-          fi
-
-      # 定时按分支头检出（master 已是同步后的头）；其余事件按触发 commit
-      - name: 解析检出的 ref（定时=同步后的分支头，其余=触发 commit）
-        id: ref
-        shell: bash
-        run: |
-          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
-            echo "ref=master" >> "$GITHUB_OUTPUT"
-          else
-            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
-          fi
+          case "$code" in
+            200) echo "已从上游同步新提交:" ;;
+            409) echo "::warning::同步失败：与上游存在 merge conflict（409），需手动解决" ;;
+            422) echo "::warning::同步失败：其它原因（422，如已是最新/未配置 upstream），继续走守卫" ;;
+            *)   echo "::warning::sync 返回 $code（继续走守卫）" ;;
+          esac
+          cat /tmp/sync.json
 
       - uses: actions/checkout@v6
         with:
-          ref: ${{ steps.ref.outputs.ref }}
+          # 定时=同步后的分支头（master 已是同步后的头）；其余事件按触发 commit
+          ref: ${{ github.event_name == 'schedule' && 'master' || github.sha }}
           fetch-depth: 1
 
       - name: 记录实际检出的 commit（供 build 复用，避免两边看到不同代码）
@@ -120,13 +110,8 @@ jobs:
           row="$(gh release view "v${VN}" --json isDraft,assets \
                  --jq '[.isDraft, ([.assets[].name | select(endswith(".apk"))] | length)] | @tsv' \
                  2>/dev/null || true)"
-          if [ -n "$row" ]; then
-            is_draft="${row%%$'\t'*}"
-            n_apk="${row##*$'\t'}"
-          else
-            is_draft=""
-            n_apk=0
-          fi
+          is_draft="${row%%$'\t'*}"   # row 为空 → 两变量均为空串，走"需要构建"分支
+          n_apk="${row##*$'\t'}"
           if [ "$is_draft" = "false" ] && [ "${n_apk:-0}" -ge 3 ]; then
             echo "v${VN} 已正式发布且资产完整（${n_apk} 个 APK）→ 跳过构建"
             echo "should_build=false" >> "$GITHUB_OUTPUT"
@@ -167,13 +152,13 @@ jobs:
             exit 1
           fi
           # 存在性预检：1 次 API 调用
-          if ! gh api "repos/${GITHUB_REPOSITORY}/commits/${INPUT}" --jq .sha > /tmp/target-sha 2>/tmp/sha.err; then
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${INPUT}" --jq .sha 2>/tmp/sha.err)" || {
             echo "::error::commit ${INPUT} 在本仓库历史中不存在（上游分支的提交需先经 cron 同步进来）"
             head -3 /tmp/sha.err || true
             exit 1
-          fi
-          echo "构建目标：$(cat /tmp/target-sha)"
-          echo "sha=$(cat /tmp/target-sha)" >> "$GITHUB_OUTPUT"
+          }
+          echo "构建目标：$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Checkout（含全部子模块）
         uses: actions/checkout@v6
@@ -265,7 +250,13 @@ jobs:
           echo "已生成 $NO_MINIFY_INIT:"
           cat "$NO_MINIFY_INIT"
 
-      # 锚点 = 整个点击体（第一次只弹提示 + 第二次直接进菜单）→ 整段替换成"每次点击都弹窗"
+      # 锚点1 = 上游整个点击体 → 3 项弹窗（打开项目主页 / 调试菜单 / 检测更新）
+      # 锚点2 = openDebugMenu() 方法行 → 之前插入 checkForUpdate()（查 GitHub 最新 Release）
+      # 检测更新（C 方案·assets 版）：请求 api.github.com/repos/<repo>/releases/latest，tag 与 APK 内版本
+      #   （BUILD_VERSION_STRING = gradle.properties 的 APP_VERSION_NAME，与 yml rel 派生 tag 同源）数字
+      #   比较；有新版弹窗逐行列出该 Release 的每个 .apk 资产（点击 browser_download_url 浏览器直接下载）。
+      #   所有失败（网络/限流/JSON 异常/版本比较异常/说明里解析不到链接）统一 Toast「检查失败」，
+      #   runOnUIThread 内整段 try/catch 包住 —— 防 tag 带非数字段时 NumberFormatException 在主线程崩 App
       - name: 注入版本号点击弹窗（构建期打补丁，不入库）
         shell: bash
         env:
@@ -275,9 +266,9 @@ jobs:
           python3 - "$F" "$REPO_URL" <<'PY'
           import sys
           path, url = sys.argv[1], sys.argv[2]
-          ind = ' ' * 12
-          # 锚点：整个点击体（带行首缩进，整段替换）
-          anchor = '\n'.join(ind + l for l in [
+          ind12 = ' ' * 12
+          # 锚点1：上游点击体（带行首缩进，整段替换）
+          anchor_click = '\n'.join(ind12 + l for l in [
               'versionViewPressCount++;',
               'if (versionViewPressCount < 2 && !BuildVars.DEBUG_PRIVATE_VERSION) {',
               '    try {',
@@ -289,30 +280,90 @@ jobs:
               '}',
               'openDebugMenu();',
           ])
-          # 替换：每次点击都弹同一个弹窗（防误触由弹窗本身承担）
-          code = '\n'.join(ind + l for l in [
+          # 3 项弹窗（v6 同风格的单行 if 链，第 3 项调 helper）
+          code_click = '\n'.join(ind12 + l for l in [
               'try {',
               '    AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), resourceProvider);',
-              '    builder.setItems(new CharSequence[]{"打开项目主页", "调试菜单"}, (dialog, which) -> {',
+              '    builder.setItems(new CharSequence[]{"打开项目主页", "调试菜单", "检测更新"}, (dialog, which) -> {',
               '        if (which == 0) org.telegram.messenger.browser.Browser.openUrl(getParentActivity(), "%s");' % url,
-              '        else openDebugMenu();',
+              '        else if (which == 1) openDebugMenu();',
+              '        else checkForUpdate();',
               '    });',
               '    builder.show();',
               '} catch (Exception e) {',
               '    FileLog.e(e);',
               '}',
           ])
+          anchor_open = '    public void openDebugMenu() {'
+          # helper：检测更新。任何失败统一「检查失败」；有新版才弹 items（每行 = 一个资产，点击即下载）
+          helper = '\n'.join('    ' + l for l in [
+              'private void checkForUpdate() {',
+              '    new Thread(() -> {',
+              '        try {',
+              '            java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URI("%s/releases/latest").toURL().openConnection();' % url,
+              '            c.setConnectTimeout(8000);',
+              '            c.setReadTimeout(8000);',
+              '            c.setRequestProperty("Accept", "application/vnd.github+json");',
+              '            String jsonStr;',
+              '            try (java.util.Scanner sc = new java.util.Scanner(c.getInputStream()).useDelimiter("\\\\A")) {',
+              '                jsonStr = sc.hasNext() ? sc.next() : "";',
+              '            }',
+              '            org.json.JSONObject json = new org.json.JSONObject(jsonStr);',
+              '            String tag = json.optString("tag_name");',
+              '            org.json.JSONArray assets = json.optJSONArray("assets");',
+              '            java.util.ArrayList<String> texts = new java.util.ArrayList<>(), urls = new java.util.ArrayList<>();',
+              '            if (assets != null) {',
+              '                for (int i = 0; i < assets.length(); i++) {',
+              '                    org.json.JSONObject a = assets.getJSONObject(i);',
+              '                    if (a.optString("name").endsWith(".apk")) {',
+              '                        texts.add(a.optString("name"));',
+              '                        urls.add(a.optString("browser_download_url"));',
+              '                    }',
+              '                }',
+              '            }',
+              '            AndroidUtilities.runOnUIThread(() -> {',
+              '                try {',
+              '                    if (tag.isEmpty() || texts.isEmpty()) {',
+              '                        Toast.makeText(getParentActivity(), "检查失败", Toast.LENGTH_SHORT).show();',
+              '                        return;',
+              '                    }',
+              '                    String v = tag.startsWith("v") ? tag.substring(1) : tag;',
+              '                    if (SharedConfig.versionBiggerOrEqual(BuildVars.BUILD_VERSION_STRING, v)) {',
+              '                        Toast.makeText(getParentActivity(), "已是最新版本 " + BuildVars.BUILD_VERSION_STRING, Toast.LENGTH_SHORT).show();',
+              '                        return;',
+              '                    }',
+              '                    new AlertDialog.Builder(getParentActivity(), resourceProvider)',
+              '                        .setTitle("发现新版本 " + v)',
+              '                        .setItems(texts.toArray(new CharSequence[0]), (d, w) -> org.telegram.messenger.browser.Browser.openUrl(getParentActivity(), urls.get(w)))',
+              '                        .show();',
+              '                } catch (Throwable e) {',
+              '                    FileLog.e(e);',
+              '                    Toast.makeText(getParentActivity(), "检查失败", Toast.LENGTH_SHORT).show();',
+              '                }',
+              '            });',
+              '        } catch (Throwable e) {',
+              '            FileLog.e(e);',
+              '            AndroidUtilities.runOnUIThread(() -> Toast.makeText(getParentActivity(), "检查失败", Toast.LENGTH_SHORT).show());',
+              '        }',
+              '    }).start();',
+              '}',
+          ])
           src = open(path, encoding='utf-8').read()
-          n = src.count(anchor)
-          if n != 1:
-              print('::error::SettingsActivity 锚点命中 %d 次（应为 1），上游可能改过这段，中止构建' % n)
+          n1 = src.count(anchor_click)
+          n2 = src.count(anchor_open)
+          if n1 != 1 or n2 != 1:
+              print('::error::SettingsActivity 锚点命中 click=%d openDebugMenu=%d（均应为 1），上游可能改过，中止构建' % (n1, n2))
               sys.exit(1)
-          open(path, 'w', encoding='utf-8').write(src.replace(anchor, code, 1))
-          print('[inject] 版本号点击 -> 每次点击都弹窗（打开项目主页 / 调试菜单），URL = %s' % url)
+          src = src.replace(anchor_click, code_click, 1)
+          src = src.replace(anchor_open, helper + '\n' + anchor_open, 1)
+          open(path, 'w', encoding='utf-8').write(src)
+          print('[inject] 版本号点击 -> 3 项弹窗（主页/调试/检测更新）+ checkForUpdate()（assets 版），URL = %s' % url)
           PY
-          grep -qF '打开项目主页' "$F" || { echo "::error::注入失败，未写入"; exit 1; }
+          grep -qF '检测更新' "$F" || { echo "::error::注入失败：弹窗第 3 项未写入"; exit 1; }
+          grep -qF 'private void checkForUpdate()' "$F" || { echo "::error::注入失败：helper 未写入"; exit 1; }
+          grep -qF 'browser_download_url' "$F" || { echo "::error::注入失败：资产解析未写入"; exit 1; }
           grep -qF 'openDebugMenu();' "$F" || { echo "::error::注入后调试菜单入口丢失"; exit 1; }
-          grep -n -A8 '打开项目主页' "$F" | head -12
+          grep -n -A6 '检测更新' "$F" | head -12
 
       - name: chmod gradlew
         run: chmod +x gradlew
@@ -331,7 +382,7 @@ jobs:
             *) echo "::error::未知 abi 选项：${ABI_INPUT}"; exit 1 ;;
           esac
           echo "CI_ABI=$A" >> "$GITHUB_ENV"          # 供 init 注入收窄、供 ABI 自检
-          echo "ABI_SUFFIX=$S" >> "$GITHUB_ENV"     # 供产物命名标注
+          echo "ABI_SUFFIX=$S" >> "$GITHUB_ENV"      # 供产物命名标注
           echo "目标 ABI：${A:-（仓库默认 4 ABI）}，后缀 ${S}"
 
       # ── 5. 确定 Release tag（取自代码版本号；导出 RELEASE_TAG 供正文直链）──
@@ -341,7 +392,6 @@ jobs:
         env:
           PUBLISH_RELEASE_INPUT: ${{ github.event.inputs.publish_release }}
         run: |
-          T=""
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             T="$GITHUB_REF_NAME"
           elif [ "$PUBLISH_RELEASE_INPUT" = "false" ]; then
@@ -415,11 +465,8 @@ jobs:
           set -euo pipefail
 
           # 自检：init 必须为 3 个 application 模块各打印过 [no-minify]
-          for m in ':TMessagesProj_App' ':TMessagesProj_AppStandalone' ':TMessagesProj_AppHuawei'; do
-            if ! grep -q "\[no-minify\] ${m} " gradle-build.log; then
-              echo "::error::方案A init 脚本未覆盖模块 ${m}（gradle-build.log 无 [no-minify]）"
-              exit 1
-            fi
+          for m in :TMessagesProj_App :TMessagesProj_AppStandalone :TMessagesProj_AppHuawei; do
+            grep -q "\[no-minify\] $m " gradle-build.log || { echo "::error::方案A init 未覆盖模块 $m"; exit 1; }
           done
           echo "自检通过：3 个模块均已关闭混淆"
 
@@ -463,7 +510,7 @@ jobs:
               return 1
             fi
           }
-          req "TMessagesProj_App/build/outputs/apk/afat/release/app.apk"             "${NAME}.apk"
+          req "TMessagesProj_App/build/outputs/apk/afat/release/app.apk"               "${NAME}.apk"
           req "TMessagesProj_AppStandalone/build/outputs/apk/afat/standalone/app.apk" "${NAME}-web.apk"
           req "TMessagesProj_AppHuawei/build/outputs/apk/afat/release/app-huawei.apk" "${NAME}-huawei.apk"
 
@@ -482,15 +529,13 @@ jobs:
 
           # 表格行：文件（有 RELEASE_TAG 拼直链，否则纯文本）| 包名 | 说明 | SHA-256
           row() {
-            local f="$1" pkg="$2" desc="$3" cell h
-            [ -f "dist/$f" ] || return 0
+            local f="$1" h
             h="$(sha256sum "dist/$f" | cut -d' ' -f1)"
             if [ -n "${RELEASE_TAG:-}" ]; then
-              cell="[\`$f\`](https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/$f)"
+              echo "| [\`$f\`](https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/$f) | $2 | $3 | \`$h\` |"
             else
-              cell="\`$f\`"
+              echo "| \`$f\` | $2 | $3 | \`$h\` |"
             fi
-            echo "| $cell | $pkg | $desc | \`$h\` |"
           }
           NOTES="$RUNNER_TEMP/RELEASENOTES.md"
           {
@@ -498,12 +543,12 @@ jobs:
             echo
             echo "- commit: \`${SHA}\`"
             echo "- 构建形态：无混淆（R8 全关）· ABI：${CI_ABI:-仓库默认 4 ABI} · 签名 = 仓库 release.keystore"
-            # 提交列表走 API：浅克隆（fetch-depth 1）下 git log 只看得到 1 条提交
+            # 上游变更走 API：浅克隆（fetch-depth 1）下 git log 只看得到 1 条提交
             UP="$(gh api "repos/${GITHUB_REPOSITORY}/commits?sha=${SHA}&per_page=20" \
-                  --jq '[.[] | select(.commit.message | startswith("update to ")) | (.commit.message | split("\n")[0]) + "|" + .sha[0:7]] | first // empty' \
+                  --jq '[.[] | select(.commit.message | startswith("update to "))][0].commit.message // empty | split("\n")[0]' \
                   2>/dev/null || true)"
             if [ -n "$UP" ]; then
-              echo "- 上游变更：${UP%%|*}（${UP##*|}）"
+              echo "- 上游变更：${UP}"
             fi
             echo
             echo "| 文件 | 包名 | 说明 | SHA-256 |"
@@ -516,12 +561,8 @@ jobs:
           echo "RELEASE_TITLE=Telegram ${VN} (${VC})" >> "$GITHUB_ENV"
           ls -lh dist/
           {
-            echo "### 构建完成"
-            echo "- 版本 ${VN} (${VC})，commit \`${SHA}\`，APK：$(ls dist/*.apk | wc -l)/3"
-            echo "- Release tag：${RELEASE_TAG:-（本次未发布）}"
-            echo '```'
+            echo "### 构建完成：${VN} (${VC}) @ \`${SHA}\`，Release：${RELEASE_TAG:-（本次未发布）}"
             (cd dist && sha256sum *.apk)
-            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       # ── 8. 单次发布（generate_release_notes 追加于正文后）──
