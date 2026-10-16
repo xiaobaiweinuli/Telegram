@@ -3,15 +3,16 @@
 # 约束：不改仓库代码，本 yml 是唯一新增文件。构建时用 -I 注入 init 脚本 （$RUNNER_TEMP），运行时关闭各模块混淆与资源瘦身，不入库。
 #
 # 构建/发布：单次调用并行构建 主版/web/华为，校验齐全后一次性发布；
-#   Release 正文 = 4 列表格（下载直链 + SHA-256，写 $RUNNER_TEMP 不作资产），
-#   generate_release_notes 追加自动变更列表。
+#   正文 = 4 列表格（直链 + SHA-256，写 $RUNNER_TEMP 不作资产）+ generate_release_notes 追加。
 #
-# 触发：tag 推送 / 手动 Run / push master / 每小时 cron（自动同步上游）
+# 触发：tag 推送 / 手动 Run / push master / cron 每天两次（03:23、15:23 UTC，自动同步上游）
+#   定时同步后按 master 头构建（check 把实际检出的 commit 传给 build）；github.sha 是触发快照，改不动
 #   守卫：v<APP_VERSION_NAME> 已发布且含 ≥3 个 APK → 秒跳；半成品由下轮 cron 补齐
 #   手动可填 build_ref = 上游 commit 哈希 → 按历史整树构建（回补漏建版本），留空 = 当前 commit
 #
-# 要点：NDK/CMake 靠 AGP 自动下载（实测 13s）；ccache 跨版本复用原生编译对象（init 注入套壳）；
-#   JVM 用 "-Xmx4g -XX:MaxMetaspaceSize=1g"；actions 全 Node24；签名 = 仓库 keystore
+# 要点：NDK/CMake 靠 AGP 自动下载（实测 13s）；ccache 跨版本复用原生编译对象（init 注入套壳，
+#   实测热缓存 43m→9m49s、命中 6913/13826）；ABI 默认 arm64-v8a，产物名带 -arm64/-armv7-arm64/-all
+#   后缀且 lib 集合逐包自检；JVM "-Xmx4g -XX:MaxMetaspaceSize=1g"；actions 全 Node24；签名 = 仓库 keystore
 
 name: Build Telegram APK
 
@@ -33,6 +34,14 @@ on:
         description: '构建指定commit（留空=当前 HEAD）'
         required: false
         default: ''
+      abi:
+        description: '目标 ABI（arm64=仅 arm64-v8a；all=仓库默认 4 ABI）'
+        type: choice
+        options:
+          - arm64
+          - arm64+armv7
+          - all
+        default: arm64
 
 permissions:
   contents: write
@@ -42,15 +51,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ── 轻量守卫 job：无需同步、无需构建时秒级结束 ──
+  # ── 轻量守卫 job：不构建时秒级结束 ──
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       should_build: ${{ steps.guard.outputs.should_build }}
+      head_sha: ${{ steps.head.outputs.sha }}
     steps:
-      # 仅定时触发：官方 Sync fork API（200=同步成功 / 409=冲突 / 422=其它原因）
-      # body 形态请求（docs.github.com 现行文档，branch 为 body 参数）
+      # 仅定时触发：官方 Sync fork API（200=同步 / 409=冲突 / 422=其它，均只警告不中断；branch 走 body）
       - name: 同步上游（仅定时触发）
         if: github.event_name == 'schedule'
         env:
@@ -74,9 +83,25 @@ jobs:
             echo "::warning::sync 返回 $code（继续走守卫）"; cat /tmp/sync.json
           fi
 
+      # 定时按分支头检出（master 已是同步后的头）；其余事件按触发 commit
+      - name: 解析检出的 ref（定时=同步后的分支头，其余=触发 commit）
+        id: ref
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            echo "ref=master" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v6
         with:
+          ref: ${{ steps.ref.outputs.ref }}
           fetch-depth: 1
+
+      - name: 记录实际检出的 commit（供 build 复用，避免两边看到不同代码）
+        id: head
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: 版本守卫（上游发新版才构建）
         id: guard
@@ -89,7 +114,8 @@ jobs:
             exit 0
           fi
           VN="$(grep -m1 '^APP_VERSION_NAME=' gradle.properties | cut -d= -f2-)"
-          # 半成品（上传中断/草稿/资产<3）放行重跑，softprops 幂等补齐
+          # 半成品（上传中断/草稿/资产<3）放行重跑，softprops 幂等补齐；
+          # 换 ABI 模式重发同版本会被跳过（≥3 已满足）→ 需先删该 Release（Release 名不含 ABI）
           row="$(gh release view "v${VN}" --json isDraft,assets \
                  --jq '[.isDraft, ([.assets[].name | select(endswith(".apk"))] | length)] | @tsv' \
                  2>/dev/null || true)"
@@ -127,8 +153,9 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          BUILD_REF_INPUT: ${{ github.event.inputs.build_ref }}
         run: |
-          INPUT="${{ github.event.inputs.build_ref }}"
+          INPUT="$BUILD_REF_INPUT"
           if [ -z "$INPUT" ]; then
             echo "未指定 build_ref → 构建当前触发的 commit"
             echo "sha=" >> "$GITHUB_OUTPUT"
@@ -150,7 +177,7 @@ jobs:
       - name: Checkout（含全部子模块）
         uses: actions/checkout@v6
         with:
-          ref: ${{ steps.findref.outputs.sha || github.sha }}
+          ref: ${{ steps.findref.outputs.sha || needs.check.outputs.head_sha || github.sha }}
           fetch-depth: 1
           submodules: recursive
 
@@ -166,9 +193,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # 缓存：非默认分支/tag 只读（官方默认）；key 含 sha 每次新条目、靠前缀恢复，
-      #   上限 10GB/7 天 → cleanup=always + 排除 build-cache-1 控体积；
-      #   setup-java 不配 gradle 缓存（与本步骤叠加会双写，官方不建议）
+      # 缓存：非默认分支/tag 只读；key 含内容哈希、靠前缀恢复；cleanup=always + 排除 build-cache-1 控体积
       - name: 设置 Gradle（依赖与构建缓存）
         uses: gradle/actions/setup-gradle@v6
         with:
@@ -215,6 +240,16 @@ jobs:
                           '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache'
                       )
                       println("[ccache] ${proj.path}")
+                      // 按 CI_ABI 收窄 ABI（空 = 保持仓库默认 4 ABI）
+                      def wantAbi = System.getenv('CI_ABI')
+                      if (wantAbi) {
+                          def abis = wantAbi.split(',') as Set
+                          proj.android.productFlavors.all { f ->
+                              f.ndk.abiFilters.clear()
+                              abis.each { f.ndk.abiFilters.add(it) }
+                          }
+                          println("[abi] ${proj.path} -> ${wantAbi}")
+                      }
                   }
               }
           }
@@ -225,15 +260,34 @@ jobs:
       - name: chmod gradlew
         run: chmod +x gradlew
 
-      # ── 4. 确定 Release tag（取自代码版本号；导出 RELEASE_TAG 供正文直链）──
+      # ── 4. 解析目标 ABI（arm64=仅 arm64-v8a；all=留空→仓库默认 4 ABI；无输入=cron/push/tag 取默认 arm64）──
+      - name: 解析目标 ABI
+        id: abi
+        shell: bash
+        env:
+          ABI_INPUT: ${{ github.event.inputs.abi }}
+        run: |
+          case "$ABI_INPUT" in
+            ""|"arm64")    A="arm64-v8a"; S="-arm64" ;;
+            "arm64+armv7") A="arm64-v8a,armeabi-v7a"; S="-armv7-arm64" ;;
+            "all")         A=""; S="-all" ;;
+            *) echo "::error::未知 abi 选项：${ABI_INPUT}"; exit 1 ;;
+          esac
+          echo "CI_ABI=$A" >> "$GITHUB_ENV"          # 供 init 注入收窄、供 ABI 自检
+          echo "ABI_SUFFIX=$S" >> "$GITHUB_ENV"     # 供产物命名标注
+          echo "目标 ABI：${A:-（仓库默认 4 ABI）}，后缀 ${S}"
+
+      # ── 5. 确定 Release tag（取自代码版本号；导出 RELEASE_TAG 供正文直链）──
       - name: 确定 Release Tag
         id: rel
         shell: bash
+        env:
+          PUBLISH_RELEASE_INPUT: ${{ github.event.inputs.publish_release }}
         run: |
           T=""
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             T="$GITHUB_REF_NAME"
-          elif [ "${{ github.event.inputs.publish_release }}" = "false" ]; then
+          elif [ "$PUBLISH_RELEASE_INPUT" = "false" ]; then
             T=""    # 手动取消勾选"发布" → 不发 Release
           else
             # 手动/push/定时 → Release 名 = v<代码里的 APP_VERSION_NAME>
@@ -248,7 +302,7 @@ jobs:
           echo "tag=$T" >> "$GITHUB_OUTPUT"
           echo "RELEASE_TAG=$T" >> "$GITHUB_ENV"   # 未发布时为空 → 打包回退纯文本
 
-      # ── 5. 构建：单次调用并行三任务（自签：向命令追加 -PRELEASE_*="${{ secrets.… }}"）──
+      # ── 6. 构建：单次调用并行三任务（自签：向命令追加 -PRELEASE_*="${{ secrets.… }}"）──
       - name: 构建主版 / web 版 / 华为版（方案A 无混淆）
         env:
           NO_MINIFY_INIT: ${{ runner.temp }}/no-minify.init.gradle
@@ -267,15 +321,25 @@ jobs:
         run: ccache -s || true
 
       - name: 保存 ccache 缓存
+        if: always()
         uses: actions/cache/save@v5
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-${{ runner.os }}-ndk27.2-${{ hashFiles('TMessagesProj/jni/**', 'TMessagesProj/**/CMakeLists.txt') }}
 
-      # ── 6. 打包：三产物齐全才放行 + 方案A 逐模块断言；
-      #      正文 4 列表格 → $RUNNER_TEMP（只当 body、不作资产、无 SUMS）──
+      - name: 失败时输出 CMake/Ninja 日志
+        if: failure()
+        run: |
+          echo "=== CMake / Ninja logs ==="
+          find TMessagesProj/.cxx -type f \( -name '*.log' -o -name '*.txt' \) 2>/dev/null \
+            | head -n 20 | while IFS= read -r f; do echo "--- $f ---"; tail -n 100 "$f"; done
+
+      # ── 7. 打包：三产物齐全才放行 + 逐模块断言；正文 4 列表格写 $RUNNER_TEMP（只当 body、无 SUMS）──
       - name: 打包产物
+        id: pkg
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -292,10 +356,16 @@ jobs:
           grep -qE '\[ccache\] :TMessagesProj$' gradle-build.log \
             || echo "::warning::init 未向 TMessagesProj 注入 ccache 套壳（构建仍有效，但未加速）"
 
+          # ABI 收窄自检（仅警告：ABI 集合比对在下方 dist 上做最终裁决）
+          if [ -n "${CI_ABI:-}" ]; then
+            grep -qE "\[abi\] :TMessagesProj -> " gradle-build.log \
+              || echo "::warning::init 未打印 [abi] 行（ABI 收窄可能未生效，将由后续比对裁决）"
+          fi
+
           VN="$(grep -m1 '^APP_VERSION_NAME=' gradle.properties | cut -d= -f2-)"
           VC="$(grep -m1 '^APP_VERSION_CODE=' gradle.properties | cut -d= -f2-)"
           SHA="$(git rev-parse --short HEAD)"
-          NAME="telegram-${VN}-${VC}-${SHA}"
+          NAME="telegram-${VN}-${VC}-${SHA}${ABI_SUFFIX:-}"
           mkdir -p dist
 
           req() {
@@ -310,6 +380,19 @@ jobs:
           req "TMessagesProj_App/build/outputs/apk/afat/release/app.apk"             "${NAME}.apk"
           req "TMessagesProj_AppStandalone/build/outputs/apk/afat/standalone/app.apk" "${NAME}-web.apk"
           req "TMessagesProj_AppHuawei/build/outputs/apk/afat/release/app-huawei.apk" "${NAME}-huawei.apk"
+
+          # ABI 自检：APK 内 lib 目录集合必须与请求一致（防注入失效却照发）
+          if [ -n "${CI_ABI:-}" ]; then
+            exp="$(printf '%s' "$CI_ABI" | tr ',' '\n' | sort | paste -sd, -)"
+            for f in dist/*.apk; do
+              act="$(unzip -l "$f" | grep -oE 'lib/[^/]+/' | sort -u | sed 's|lib/||; s|/$||' | paste -sd, - || true)"
+              if [ "$act" != "$exp" ]; then
+                echo "::error::ABI 不符（$(basename "$f")）：实际 [${act}] ≠ 请求 [${exp}]"
+                exit 1
+              fi
+            done
+            echo "ABI 自检通过：${exp}"
+          fi
 
           # 表格行：文件（有 RELEASE_TAG 拼直链，否则纯文本）| 包名 | 说明 | SHA-256
           row() {
@@ -328,8 +411,11 @@ jobs:
             echo "# Telegram ${VN} (${VC})"
             echo
             echo "- commit: \`${SHA}\`"
-            echo "- 构建形态：混淆（R8 全关）· 4 ABI fat APK · 签名 = 仓库 release.keystore"
-            UP="$(git log -20 --format='%s|%h' | grep -m1 '^update to ' || true)"
+            echo "- 构建形态：无混淆（R8 全关）· ABI：${CI_ABI:-仓库默认 4 ABI} · 签名 = 仓库 release.keystore"
+            # 提交列表走 API：浅克隆（fetch-depth 1）下 git log 只看得到 1 条提交
+            UP="$(gh api "repos/${GITHUB_REPOSITORY}/commits?sha=${SHA}&per_page=20" \
+                  --jq '[.[] | select(.commit.message | startswith("update to ")) | (.commit.message | split("\n")[0]) + "|" + .sha[0:7]] | first // empty' \
+                  2>/dev/null || true)"
             if [ -n "$UP" ]; then
               echo "- 上游变更：${UP%%|*}（${UP##*|}）"
             fi
@@ -352,29 +438,23 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ── 7. 单次发布（generate_release_notes 追加于正文后）──
+      # ── 8. 单次发布（generate_release_notes 追加于正文后）──
       - name: 发布 Release
         if: steps.rel.outputs.tag != ''
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.rel.outputs.tag }}
           name: ${{ env.RELEASE_TITLE }}
-          target_commitish: ${{ steps.findref.outputs.sha || github.sha }}
+          target_commitish: ${{ steps.findref.outputs.sha || needs.check.outputs.head_sha || github.sha }}
           prerelease: ${{ contains(steps.rel.outputs.tag, '-') }}
           files: dist/*
           fail_on_unmatched_files: true
           body_path: ${{ runner.temp }}/RELEASENOTES.md
           generate_release_notes: true
 
-      - name: 失败时输出 CMake/Ninja 日志
-        if: failure()
-        run: |
-          echo "=== CMake / Ninja logs ==="
-          find TMessagesProj/.cxx -type f \( -name '*.log' -o -name '*.txt' \) 2>/dev/null \
-            | head -n 20 | while IFS= read -r f; do echo "--- $f ---"; tail -n 100 "$f"; done
-
-      # ── 8. Artifact（备份：完整 dist，保留 3 天）──
+      # ── 9. Artifact（完整 dist，保留 3 天；发布失败也不丢产物）──
       - name: 上传构建产物（Artifact）
+        if: ${{ !cancelled() && steps.pkg.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: telegram-apk
