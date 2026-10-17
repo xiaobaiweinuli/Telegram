@@ -64,9 +64,9 @@ jobs:
       should_build: ${{ steps.guard.outputs.should_build }}
       head_sha: ${{ steps.head.outputs.sha }}
     steps:
-      # 仅定时触发：官方 Sync fork API（200=同步 / 409=冲突 / 422=其它，均只警告不中断；branch 走 body）
-      - name: 同步上游（仅定时触发）
-        if: github.event_name == 'schedule'
+      # 定时 / webhook触发：官方 Sync fork API（200=同步 / 409=冲突 / 422=其它，均只警告不中断；branch 走 body）
+      - name: 同步上游（定时 / webhook 触发）
+        if: github.event_name == 'schedule' || github.event_name == 'repository_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -86,8 +86,8 @@ jobs:
 
       - uses: actions/checkout@v6
         with:
-          # 定时=同步后的分支头（master 已是同步后的头）；其余事件按触发 commit
-          ref: ${{ github.event_name == 'schedule' && 'master' || github.sha }}
+          # 定时 / webhook =同步后的分支头（master 已是同步后的头）；其余事件按触发 commit
+          ref: ${{ (github.event_name == 'schedule' || github.event_name == 'repository_dispatch') && 'master' || github.sha }}
           fetch-depth: 1
 
       - name: 记录实际检出的 commit（供 build 复用，避免两边看到不同代码）
