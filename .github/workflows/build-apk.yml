@@ -6,9 +6,9 @@
 #   正文 = 4 列表格（直链 + SHA-256，写 $RUNNER_TEMP 不作资产）+ generate_release_notes 追加。
 #   资产另含 latest.json（App 更新检查入口，URL 固定为 /releases/latest/download/latest.json）
 #
-# 触发：tag 推送 / 手动 Run / cron 每天一次 / webhook推送（自动同步上游）
+# 触发：手动 Run / cron 每天一次 / webhook 推送（自动同步上游）
 #   定时同步后按 master 头构建（check 把实际检出的 commit 传给 build）；github.sha 是触发快照，改不动
-#   守卫：v<APP_VERSION_NAME>.<APP_VERSION_CODE> 已发布且含 ≥3 个 APK → 秒跳；半成品由下轮 cron 补齐
+#   守卫：v<APP_VERSION_NAME>.<APP_VERSION_CODE> 已发布且含 ≥3 个 APK + latest.json → 秒跳；半成品由下轮 cron 补齐
 #   手动可填 build_ref = 上游 commit 哈希 → 按历史整树构建（回补漏建版本），留空 = 当前 commit
 #
 # 要点：NDK/CMake 靠 AGP 自动下载（实测 13s）；ccache 跨版本复用原生编译对象（init 注入套壳，
@@ -544,6 +544,7 @@ jobs:
           #   客户端请求 <repo>/releases/latest/download/latest.json（资产下载，不吃 API 限额）；
           #   /releases/latest 只认最新正式 Release（不含草稿/预发布），缺失该资产即 404、不会回退。
           #   version = 裸版本名（无 v 前缀）；version_code = 整数（--argjson，客户端 optInt 直读）。
+          #   label = 「渠道 (文件名主干)」，供弹窗单行显示；$s 由 NAME 剥 telegram- 前缀得到，与 url 同源。
           sha_of() { sha256sum "dist/$1" | cut -d' ' -f1; }
           jq -n \
             --arg v "$VN" --argjson vc "$VC" --arg abi "${CI_ABI:-4abi}" \
@@ -552,13 +553,12 @@ jobs:
             --arg h1 "$(sha_of "${NAME}.apk")" \
             --arg h2 "$(sha_of "${NAME}-web.apk")" \
             --arg h3 "$(sha_of "${NAME}-huawei.apk")" \
-            'def u($x): $base + "/" + $n + $x + ".apk";
-             {
+            '{
                version: $v, version_code: $vc, abi: $abi,
                apks: [
-                 {label: ("主版 ("   + $s + ")"), url: u(""),        sha256: $h1},
-                 {label: ("web 版 (" + $s + ")"), url: u("-web"),    sha256: $h2},
-                 {label: ("华为版 (" + $s + ")"), url: u("-huawei"), sha256: $h3}
+                 {label: ("主版 ("   + $s + ")"),           url: ($base + "/" + $n + ".apk"),           sha256: $h1},
+                 {label: ("web 版 (" + $s + "-web" + ")"),  url: ($base + "/" + $n + "-web.apk"),       sha256: $h2},
+                 {label: ("华为版 (" + $s + "-huawei" + ")"), url: ($base + "/" + $n + "-huawei.apk"),  sha256: $h3}
                ]
              }' > dist/latest.json
           jq -c . dist/latest.json
