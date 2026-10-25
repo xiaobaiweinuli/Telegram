@@ -70,9 +70,9 @@ jobs:
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/merge-upstream")
           case "$code" in
             200) echo "已从上游同步新提交:" ;;
-            409) echo "::warning::同步失败：与上游存在 merge conflict（409），需手动解决" ;;
-            422) echo "::warning::同步失败：其它原因（422，如已是最新/未配置 upstream），继续走守卫" ;;
-            *)   echo "::warning::sync 返回 $code（继续走守卫）" ;;
+            409) echo "::error::同步失败：与上游存在 merge conflict，需人工解决"; exit 1 ;;
+            422) echo "已是最新或未配置 upstream（422）" ;;
+            *)   echo "::error::sync 返回 $code"; exit 1 ;;
           esac
           cat /tmp/sync.json
 
