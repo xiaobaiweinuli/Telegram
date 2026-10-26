@@ -3,7 +3,7 @@
 # 约束：不改仓库代码，本 yml 是唯一新增文件。构建时用 -I 注入 init 脚本 （$RUNNER_TEMP），运行时关闭各模块混淆与资源瘦身，不入库。
 #
 # 构建/发布：单次调用并行构建 主版/web/华为，校验齐全后一次性发布；
-#   正文 = 4 列表格（直链 + SHA-256，写 $RUNNER_TEMP 不作资产）+ generate_release_notes 追加。
+#   正文 = 3 列表格（直链 + 包名 + 说明，写 $RUNNER_TEMP 不作资产）+ generate_release_notes 追加。
 #   资产另含 latest.json（App 更新检查入口，URL 固定为 /releases/latest/download/latest.json）
 #
 # 触发：手动 Run / webhook 推送（自动同步上游）
@@ -466,7 +466,7 @@ jobs:
           find TMessagesProj/.cxx -type f \( -name '*.log' -o -name '*.txt' \) 2>/dev/null \
             | head -n 20 | while IFS= read -r f; do echo "--- $f ---"; tail -n 100 "$f"; done
 
-      # ── 7. 打包：三产物齐全才放行 + 逐模块断言；正文 4 列表格写 $RUNNER_TEMP + latest.json 作资产 ──
+      # ── 7. 打包：三产物齐全才放行 + 逐模块断言；正文 3 列表格写 $RUNNER_TEMP + latest.json 作资产 ──
       - name: 打包产物
         id: pkg
         shell: bash
@@ -561,14 +561,13 @@ jobs:
              }' > dist/latest.json
           jq -c . dist/latest.json
 
-          # 表格行：文件（有 RELEASE_TAG 拼直链，否则纯文本）| 包名 | 说明 | SHA-256
+          # 表格行：文件（有 RELEASE_TAG 拼直链，否则纯文本）| 包名 | 说明
           row() {
-            local f="$1" h
-            h="$(sha256sum "dist/$f" | cut -d' ' -f1)"
+            local f="$1"
             if [ -n "${RELEASE_TAG:-}" ]; then
-              echo "| [\`$f\`](https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/$f) | $2 | $3 | \`$h\` |"
+              echo "| [\`$f\`](https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/$f) | $2 | $3 |"
             else
-              echo "| \`$f\` | $2 | $3 | \`$h\` |"
+              echo "| \`$f\` | $2 | $3 |"
             fi
           }
           NOTES="$RUNNER_TEMP/RELEASENOTES.md"
@@ -585,8 +584,8 @@ jobs:
               echo "- 上游变更：${UP}"
             fi
             echo
-            echo "| 文件 | 包名 | 说明 | SHA-256 |"
-            echo "|---|---|---|---|"
+            echo "| 文件 | 包名 | 说明 |"
+            echo "|---|---|---|"
             row "${NAME}.apk"        "org.telegram.messenger"      "主版"
             row "${NAME}-web.apk"    "org.telegram.messenger.web"  "独立包名，可与主版并存"
             row "${NAME}-huawei.apk" "org.telegram.messenger"      "华为渠道（HMS），与主版同包名互相覆盖"
