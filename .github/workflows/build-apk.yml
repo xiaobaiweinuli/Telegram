@@ -206,9 +206,8 @@ jobs:
           restore-keys: |
             ccache-${{ runner.os }}-ndk27.2-
 
-      # ── 3. 构建期注入（都不入库，仓库源码保持干净）──
-      #   ① init 脚本：关混淆/资源瘦身 + ccache 套壳 + ABI 收窄
-      #   ② 版本号点击补丁：每次点击都弹窗（打开项目主页 / 调试菜单 / 检测更新）
+      # ── 3. 构建期注入（临时 init 脚本，不修改仓库源码）──
+      #   init 脚本：关混淆/资源瘦身 + ccache 套壳 + ABI 收窄
       - name: 生成 CI 注入脚本
         shell: bash
         env:
@@ -252,124 +251,6 @@ jobs:
           GROOVY
           echo "已生成 $NO_MINIFY_INIT:"
           cat "$NO_MINIFY_INIT"
-
-      # 锚点1 = 上游整个点击体 → 3 项弹窗（打开项目主页 / 调试菜单 / 检测更新）
-      # 锚点2 = openDebugMenu() 方法行 → 之前插入 checkForUpdate()（查最新 Release 的 latest.json）
-      # 检测更新（资产版）：请求 <repo>/releases/latest/download/latest.json —— 资产下载地址而非 api.github.com，
-      #   格式见「打包产物」步骤；version 为裸版本名（无 v 前缀），version_code 为整数。
-      #   判定：版本名更大 或（版本名相同且 version_code 更大）→ 提示更新；两者都不满足才算最新。
-      #   所有失败（网络/404/JSON 异常/版本比较异常）统一 Toast「检查失败」，
-      #   runOnUIThread 内整段 try/catch 包住 —— 防 version 带非数字段时 NumberFormatException 在主线程崩 App
-      - name: 注入版本号点击弹窗（构建期打补丁，不入库）
-        shell: bash
-        env:
-          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
-        run: |
-          F=TMessagesProj/src/main/java/org/telegram/ui/SettingsActivity.java
-          python3 - "$F" "$REPO_URL" <<'PY'
-          import sys
-          path, url = sys.argv[1], sys.argv[2]
-          ind12 = ' ' * 12
-          # 上游点击体（带行首缩进，整段替换）
-          anchor_click = '\n'.join(ind12 + l for l in [
-              'versionViewPressCount++;',
-              'if (versionViewPressCount < 2 && !BuildVars.DEBUG_PRIVATE_VERSION) {',
-              '    try {',
-              '        Toast.makeText(getParentActivity(), getString(R.string.DebugMenuLongPress), Toast.LENGTH_SHORT).show();',
-              '    } catch (Exception e) {',
-              '        FileLog.e(e);',
-              '    }',
-              '    return;',
-              '}',
-              'openDebugMenu();',
-          ])
-          # 3项弹窗（第 3 项调 helper）
-          code_click = '\n'.join(ind12 + l for l in [
-              'try {',
-              '    AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), resourceProvider);',
-              '    builder.setItems(new CharSequence[]{"打开项目主页", "调试菜单", "检测更新"}, (dialog, which) -> {',
-              '        if (which == 0) org.telegram.messenger.browser.Browser.openUrl(getParentActivity(), "%s");' % url,
-              '        else if (which == 1) openDebugMenu();',
-              '        else checkForUpdate();',
-              '    });',
-              '    builder.show();',
-              '} catch (Exception e) {',
-              '    FileLog.e(e);',
-              '}',
-          ])
-          anchor_open = '    public void openDebugMenu() {'
-          # helper：检测更新。任何失败统一「检查失败」；有新版才弹 items（每行 = latest.json 里一个 apk，点击即下载）
-          #   安装包 versionCode = APP_VERSION_CODE*10 + abiVersionCode（afat=9，见各模块 build.gradle），故 /10 还原成逻辑版本号，才能与 latest.json 的 version_code 同量纲比较
-          helper = '\n'.join('    ' + l for l in [
-              'private void checkForUpdate() {',
-              '    new Thread(() -> {',
-              '        try {',
-              '            java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URI("%s/releases/latest/download/latest.json").toURL().openConnection();' % url,
-              '            c.setConnectTimeout(8000);',
-              '            c.setReadTimeout(8000);',
-              '            c.setRequestProperty("Cache-Control", "no-cache");',
-              '            String jsonStr;',
-              '            try (java.util.Scanner sc = new java.util.Scanner(c.getInputStream()).useDelimiter("\\\\A")) {',
-              '                jsonStr = sc.hasNext() ? sc.next() : "";',
-              '            }',
-              '            org.json.JSONObject json = new org.json.JSONObject(jsonStr);',
-              '            String v = json.optString("version");',
-              '            int rc = json.optInt("version_code", 0);',
-              '            org.json.JSONArray apks = json.optJSONArray("apks");',
-              '            java.util.ArrayList<String> texts = new java.util.ArrayList<>(), urls = new java.util.ArrayList<>();',
-              '            if (apks != null) {',
-              '                for (int i = 0; i < apks.length(); i++) {',
-              '                    org.json.JSONObject a = apks.getJSONObject(i);',
-              '                    String u = a.optString("url");',
-              '                    if (!u.isEmpty()) {',
-              '                        texts.add(a.optString("label"));',
-              '                        urls.add(u);',
-              '                    }',
-              '                }',
-              '            }',
-              '            AndroidUtilities.runOnUIThread(() -> {',
-              '                try {',
-              '                    if (v.isEmpty() || texts.isEmpty()) {',
-              '                        Toast.makeText(getParentActivity(), "检查失败", Toast.LENGTH_SHORT).show();',
-              '                        return;',
-              '                    }',
-              '                    int lc = ApplicationLoader.applicationContext.getPackageManager().getPackageInfo(ApplicationLoader.applicationContext.getPackageName(), 0).versionCode / 10;',
-              '                    if (SharedConfig.versionBiggerOrEqual(BuildVars.BUILD_VERSION_STRING, v) && lc >= rc) {',
-              '                        Toast.makeText(getParentActivity(), "已是最新版本 " + BuildVars.BUILD_VERSION_STRING + " (" + lc + ")", Toast.LENGTH_SHORT).show();',
-              '                        return;',
-              '                    }',
-              '                    new AlertDialog.Builder(getParentActivity(), resourceProvider)',
-              '                        .setTitle("发现新版本 " + v + " (" + rc + ")")',
-              '                        .setItems(texts.toArray(new CharSequence[0]), (d, w) -> org.telegram.messenger.browser.Browser.openUrl(getParentActivity(), urls.get(w)))',
-              '                        .show();',
-              '                } catch (Throwable e) {',
-              '                    FileLog.e(e);',
-              '                    Toast.makeText(getParentActivity(), "检查失败", Toast.LENGTH_SHORT).show();',
-              '                }',
-              '            });',
-              '        } catch (Throwable e) {',
-              '            FileLog.e(e);',
-              '            AndroidUtilities.runOnUIThread(() -> Toast.makeText(getParentActivity(), "检查失败", Toast.LENGTH_SHORT).show());',
-              '        }',
-              '    }).start();',
-              '}',
-          ])
-          src = open(path, encoding='utf-8').read()
-          n1 = src.count(anchor_click)
-          n2 = src.count(anchor_open)
-          if n1 != 1 or n2 != 1:
-              print('::error::SettingsActivity 锚点命中 click=%d openDebugMenu=%d（均应为 1），上游可能改过，中止构建' % (n1, n2))
-              sys.exit(1)
-          src = src.replace(anchor_click, code_click, 1)
-          src = src.replace(anchor_open, helper + '\n' + anchor_open, 1)
-          open(path, 'w', encoding='utf-8').write(src)
-          print('[inject] 版本号点击 -> 3 项弹窗（主页/调试/检测更新）+ checkForUpdate()（latest.json 版），URL = %s' % url)
-          PY
-          grep -qF '检测更新' "$F" || { echo "::error::注入失败：弹窗第 3 项未写入"; exit 1; }
-          grep -qF 'private void checkForUpdate()' "$F" || { echo "::error::注入失败：helper 未写入"; exit 1; }
-          grep -qF 'releases/latest/download/latest.json' "$F" || { echo "::error::注入失败：latest.json 地址未写入"; exit 1; }
-          grep -qF 'openDebugMenu();' "$F" || { echo "::error::注入后调试菜单入口丢失"; exit 1; }
-          grep -n -A6 '检测更新' "$F" | head -12
 
       - name: chmod gradlew
         run: chmod +x gradlew
