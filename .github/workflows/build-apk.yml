@@ -6,7 +6,7 @@
 #   正文 = 3 列表格（直链 + 包名 + 说明，写 $RUNNER_TEMP 不作资产）+ generate_release_notes 追加。
 #   资产另含 latest.json（App 更新检查入口，URL 固定为 /releases/latest/download/latest.json）
 #
-# 触发：手动 Run / webhook 推送（自动同步上游）
+# 触发：手动 Run / webhook 推送（都先自动同步上游；手动填了 build_ref 则跳过同步，按历史 commit 构建）
 #   同步后按 master 头构建（check 把实际检出的 commit 传给 build）；github.sha 是触发快照，改不动
 #   守卫：v<APP_VERSION_NAME>.<APP_VERSION_CODE> 已发布且含 ≥3 个 APK + latest.json → 秒跳；半成品由再次运行补齐
 #   手动可填 build_ref = 上游 commit 哈希 → 按历史整树构建（回补漏建版本），留空 = 当前 commit
@@ -56,9 +56,13 @@ jobs:
       should_build: ${{ steps.guard.outputs.should_build }}
       head_sha: ${{ steps.head.outputs.sha }}
     steps:
-      # webhook触发：官方 Sync fork API（200=同步 / 409=冲突 / 422=其它，均只警告不中断；branch 走 body）
-      - name: 同步上游（webhook 触发）
-        if: github.event_name == 'repository_dispatch'
+      # 官方 Sync fork API（200=同步 / 409=冲突 / 422=已最新或未配 upstream；branch 走 body）
+      #   触发条件：webhook 必定同步；手动运行仅在 master 上且未填 build_ref 时同步
+      #   （填了 build_ref 是要回补某个历史版本，此时同步无用且会让它检出的树变味）
+      - name: 同步上游
+        id: sync
+        # 单行表达式：多行折叠在新旧解析器上表现不一，宁可长一行
+        if: github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_ref == '' && github.ref == 'refs/heads/master')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -70,16 +74,24 @@ jobs:
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/merge-upstream")
           case "$code" in
             200) echo "已从上游同步新提交:" ;;
-            409) echo "::error::同步失败：与上游存在 merge conflict，需人工解决"; exit 1 ;;
             422) echo "已是最新或未配置 upstream（422）" ;;
-            *)   echo "::error::sync 返回 $code"; exit 1 ;;
+            409|*)
+              # webhook：同步就是本次触发的目的，失败即中止
+              # 手动：冲突不该让人连构建都跑不了 → 只警告，按当前 master 头继续
+              if [ "$GITHUB_EVENT_NAME" = "repository_dispatch" ]; then
+                echo "::error::同步失败（$code）：与上游存在 merge conflict 或 API 异常，需人工解决"
+                exit 1
+              fi
+              echo "::warning::同步失败（$code）：按当前 master 头构建，merge conflict 需人工解决"
+              ;;
           esac
-          cat /tmp/sync.json
+          cat /tmp/sync.json 2>/dev/null || true
+          echo "synced=true" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v6
         with:
-          # webhook =同步后的分支头（master 已是同步后的头）；其余事件按触发 commit
-          ref: ${{ github.event_name == 'repository_dispatch' && 'master' || github.sha }}
+          # 同步过 → 取同步后的 master 头；未同步（填了 build_ref / 非 master 分支）→ 按触发 commit
+          ref: ${{ steps.sync.outputs.synced == 'true' && 'master' || github.sha }}
           fetch-depth: 1
 
       - name: 记录实际检出的 commit（供 build 复用，避免两边看到不同代码）
