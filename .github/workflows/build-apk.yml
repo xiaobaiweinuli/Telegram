@@ -73,7 +73,14 @@ jobs:
             -d '{"branch":"master"}' \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/merge-upstream")
           case "$code" in
-            200) echo "已从上游同步新提交:" ;;
+            200)
+              mt="$(jq -r '.merge_type // "?"' /tmp/sync.json)"
+              if [ "$mt" = "none" ]; then
+                echo "已与上游一致，无新提交可同步（merge_type=none）"
+              else
+                echo "已从上游同步（merge_type=${mt}）"
+              fi
+              ;;
             422) echo "已是最新或未配置 upstream（422）" ;;
             409|*)
               # webhook：同步就是本次触发的目的，失败即中止
